@@ -1,0 +1,38 @@
+[build-system]
+requires = ["flit-core>=3.6,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "aiidalab-widgets-empa"
+dynamic = ["version"]
+description = "Reusable AiiDAlab widgets developed at Empa."
+classifiers = [
+    "Framework :: AiiDA",
+    "Framework :: Jupyter",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Natural Language :: English",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+requires-python = ">=3.9,<4"
+readme = "README.md"
+dependencies = [
+    "aiida-core>=2.6.0,<3",
+]
+
+[project.urls]
+Homepage = "https://github.com/nanotech-empa/aiidalab-widgets-empa"
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "pre-commit",
+    "bumpver",
+    "coverage",
+]
