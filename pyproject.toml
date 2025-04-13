@@ -23,6 +23,8 @@ requires-python = ">=3.9,<4"
 readme = "README.md"
 dependencies = [
     "aiida-core>=2.6.0,<3",
+    "ipywidgets>=7.6.0",
+    "timelength",  # not a super-established package, but seems to be the best option for parsing the human-readable time strings
 ]
 
 [project.urls]
