@@ -1,8 +1,8 @@
 from .computational_resources import ProcessResourcesWidget, ResourcesEstimatorWidget
-
+from .version import __version__
 
 __all__ = [
     "ProcessResourcesWidget",
     "ResourcesEstimatorWidget",
+    "__version__",
 ]
-__version__ = "0.0.0"
