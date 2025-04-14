@@ -39,13 +39,13 @@ def test_structure_upload_widget():
                 }
             }
         }
-    )    
+    )
     # sets 2 units, finite size
-    widget.nunits.value = '2'
+    widget.nunits.value = "2"
     widget.create_button.click()
     assert isinstance(widget.structure, ase.Atoms)
     assert widget.structure.get_chemical_formula() == "C56H22"
-    
+
     # case of benzene molecule
     filename = Path(__file__).parent / "benzene.cdxml"
 
@@ -60,7 +60,7 @@ def test_structure_upload_widget():
                 }
             }
         }
-    )    
+    )
     widget.create_button.click()
     assert isinstance(widget.structure, ase.Atoms)
     assert widget.structure.get_chemical_formula() == "C6H6"
