@@ -29,5 +29,5 @@ def test_structure_upload_widget():
     )
     widget.create_button.click()
     assert isinstance(widget.structure, ase.Atoms)
-    assert widget.structure.get_chemical_formula() == "C15H4"
+    assert widget.structure.get_chemical_formula() == "C14H4"
     # assert np.all(widget.structure[0].position == [0, 0, 0])

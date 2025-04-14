@@ -103,8 +103,8 @@ class CdxmlUploadWidget(ipw.VBox):
         self.nunits.value = "Infinite"
         self.nunits.disabled = True
 
-        uploaded_file = list(self.file_upload.value.values())[0]
-        cdxml_content = uploaded_file["content"].decode("utf-8")
+        filename = list(change["new"].keys())[0]
+        cdxml_content = change['new'][filename]['content'].decode("utf-8")
         try:
             self.atoms = self.cdxml_to_ase_from_string(cdxml_content)
             (
