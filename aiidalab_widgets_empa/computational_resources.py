@@ -152,7 +152,7 @@ class ResourcesEstimatorWidget(ipw.VBox):
     def __init__(
         self,
         calculation_type="dft",
-        node_hour_price=1.0,
+        price_per_hour=1.0,
         currency="CHF",
         price_link=None,
     ):
@@ -167,7 +167,7 @@ class ResourcesEstimatorWidget(ipw.VBox):
             value="",
             style=STYLE,
         )
-        self.node_hour_price = node_hour_price
+        self.price_per_hour = price_per_hour
         self.currency = currency
         self.price_link = price_link
 
@@ -229,7 +229,7 @@ class ResourcesEstimatorWidget(ipw.VBox):
         if "daint" in code:
             price_info = (
                 f"""<i class='fa fa-info-circle' style='color:blue;font-size:2em;' ></i> """
-                f"""Total Estimated Cost: {self.resources.nodes_widget.value * self.node_hour_price * self.walltime_hours:.2f} {self.currency}.<br>"""
+                f"""Total Estimated Cost: {self.resources.nodes_widget.value * self.price_per_hour * self.walltime_hours:.2f} {self.currency}.<br>"""
             )
 
             if self.price_link:
