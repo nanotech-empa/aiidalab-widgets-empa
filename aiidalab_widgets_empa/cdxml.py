@@ -103,8 +103,18 @@ class CdxmlUploadWidget(ipw.VBox):
         self.nunits.value = "Infinite"
         self.nunits.disabled = True
 
-        filename = list(change["new"].keys())[0]
-        cdxml_content = change["new"][filename]["content"].decode("utf-8")
+        def get_unified_representation(value):
+            """This function ensures backwards compatibility w.r.t. ipywidgets 7.x"""
+            try:
+                return [
+                    (fname, item["content"]) for fname, item in value.items()
+                ]  # ipywidgets 7.x
+            except AttributeError:
+                return [
+                    (f["name"], f.content.tobytes()) for f in value
+                ]  # ipywidgets 8.x
+
+        _, cdxml_content = get_unified_representation(change["new"])[0]
         try:
             self.atoms = self.cdxml_to_ase_from_string(cdxml_content)
             (
@@ -116,9 +126,6 @@ class CdxmlUploadWidget(ipw.VBox):
             self.output_message.value = f"Error: {exc}"
         except Exception as exc:
             self.output_message.value = f"Unexpected error: {exc}"
-
-        # Clear the file upload widget
-        self.file_upload.value.clear()
 
     def _on_button_click(self, _=None):
         """Handles the creation of the ASE model when 'Create model' button is clicked."""
