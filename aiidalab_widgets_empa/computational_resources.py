@@ -29,7 +29,7 @@ class ProcessResourcesWidget(ipw.VBox):
     nproc_replica_trait = tr.Int()
     n_replica_trait = tr.Int()
     n_replica_per_group_trait = tr.Int()
-    walltime_seconds = tr.Float(allow_none=True)
+    walltime_seconds = tr.Int(allow_none=True)
     neb = tr.Bool()
     phonons = tr.Bool()
 
@@ -134,7 +134,7 @@ class ProcessResourcesWidget(ipw.VBox):
         t_length = timelength.TimeLength(self.walltime_widget.value)
 
         if t_length.result.success:
-            self.walltime_seconds = t_length.result.seconds
+            self.walltime_seconds = int(t_length.result.seconds)
             self.time_info.value = f"Total walltime: {t_length.result.delta}"
         else:
             self.wrong_syntax.layout.visibility = "visible"
