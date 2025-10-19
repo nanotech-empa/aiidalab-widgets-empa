@@ -17,6 +17,7 @@ from ase.neighborlist import NeighborList
 """Widget to convert CDXML files into planar ASE.Atoms structures with alignment,
 trimming, hydrogen restoration, and optional replication along the periodic axis."""
 
+
 # ---------------- Utility functions ----------------
 def normalize(v: np.ndarray) -> np.ndarray:
     """Return the normalized version of vector v, or zeros if near-zero norm."""
@@ -59,7 +60,9 @@ class CdxmlUploadWidget(ipw.VBox):
 
     structure = tr.Instance(ase.Atoms, allow_none=True)
 
-    def __init__(self, title: str = "CDXML to GNR", description: str = "Upload Structure"):
+    def __init__(
+        self, title: str = "CDXML to GNR", description: str = "Upload Structure"
+    ):
         self.title = title
 
         # --- File upload widget ---
@@ -73,7 +76,9 @@ class CdxmlUploadWidget(ipw.VBox):
 
         # --- Additional widgets ---
         self.nunits = ipw.Text(description="N units", value="Infinite", disabled=True)
-        self.create_button = ipw.Button(description="Create model", button_style="success")
+        self.create_button = ipw.Button(
+            description="Create model", button_style="success"
+        )
         self.create_button.on_click(self._on_button_click)
 
         supported_formats = ipw.HTML(
@@ -119,8 +124,8 @@ class CdxmlUploadWidget(ipw.VBox):
         _, cdxml_content = get_unified_representation(change["new"])[0]
 
         try:
-            self.output_message.value, self.atoms, self.whole_atoms = self.cdxml_to_ase_from_string(
-                cdxml_content
+            self.output_message.value, self.atoms, self.whole_atoms = (
+                self.cdxml_to_ase_from_string(cdxml_content)
             )
             self.crossing_points, self.cdxml_atoms, self.nunits.disabled = (
                 self.extract_crossing_and_atom_positions(cdxml_content)
@@ -213,12 +218,11 @@ class CdxmlUploadWidget(ipw.VBox):
         }
 
         bond_order_map = {
-            "1": 1.0,   # single bond
-            "2": 2.0,   # double bond
-            "3": 3.0,   # triple bond
-            "A": 1.5,   # aromatic bond
+            "1": 1.0,  # single bond
+            "2": 2.0,  # double bond
+            "3": 3.0,  # triple bond
+            "A": 1.5,  # aromatic bond
         }
-
 
         atoms, bonds, radicals = {}, [], set()
 
@@ -293,7 +297,11 @@ class CdxmlUploadWidget(ipw.VBox):
                     sym.append("H")
 
             if el != "C":
-                avg = normalize(-np.sum(neighbors, axis=0)) if neighbors else np.array([0, 0, 1])
+                avg = (
+                    normalize(-np.sum(neighbors, axis=0))
+                    if neighbors
+                    else np.array([0, 0, 1])
+                )
                 add_H([avg], 1.01)
                 continue
 
@@ -302,7 +310,13 @@ class CdxmlUploadWidget(ipw.VBox):
                 v = neighbors[0]
                 theta = math.radians(109.47)
                 dirs = [
-                    np.array([math.sin(theta) * math.cos(p), math.sin(theta) * math.sin(p), math.cos(theta)])
+                    np.array(
+                        [
+                            math.sin(theta) * math.cos(p),
+                            math.sin(theta) * math.sin(p),
+                            math.cos(theta),
+                        ]
+                    )
                     for p in (0, 2 * math.pi / 3, 4 * math.pi / 3)
                 ]
                 R = rotation_matrix_from_vectors(np.array([0, 0, 1]), -v)
@@ -318,13 +332,22 @@ class CdxmlUploadWidget(ipw.VBox):
                         normal = np.array([0, 0, 1])
                         bis = -v
                         add_H(
-                            [rotate_vector(bis, normal, math.radians(a)) for a in (60, -60)],
+                            [
+                                rotate_vector(bis, normal, math.radians(a))
+                                for a in (60, -60)
+                            ],
                             CH_len,
                         )
                     else:
                         theta = math.radians(109.47)
                         dirs = [
-                            np.array([math.sin(theta) * math.cos(p), math.sin(theta) * math.sin(p), math.cos(theta)])
+                            np.array(
+                                [
+                                    math.sin(theta) * math.cos(p),
+                                    math.sin(theta) * math.sin(p),
+                                    math.cos(theta),
+                                ]
+                            )
                             for p in (0, 2 * math.pi / 3)
                         ]
                         R = rotation_matrix_from_vectors(np.array([0, 0, 1]), -v)
@@ -337,7 +360,10 @@ class CdxmlUploadWidget(ipw.VBox):
                     plane_normal = normalize(np.cross(v1, v2))
                     if any(o >= 1.5 for o in orders):
                         add_H(
-                            [rotate_vector(bis, plane_normal, math.radians(a)) for a in (60, -60)],
+                            [
+                                rotate_vector(bis, plane_normal, math.radians(a))
+                                for a in (60, -60)
+                            ],
                             CH_len,
                         )
                     else:
@@ -363,11 +389,16 @@ class CdxmlUploadWidget(ipw.VBox):
 
     # ---------------- Geometry utilities ----------------
     @staticmethod
-    def transform_points(set1: np.ndarray, set2: np.ndarray, points: np.ndarray) -> List[List[float]]:
+    def transform_points(
+        set1: np.ndarray, set2: np.ndarray, points: np.ndarray
+    ) -> List[List[float]]:
         """Transform points based on scaling and rotation aligning set1→set2."""
         centroid1, centroid2 = np.mean(set1, axis=0), np.mean(set2, axis=0)
         centered1, centered2 = set1 - centroid1, set2 - centroid2
-        scale = np.linalg.norm(centered2, axis=1).mean() / np.linalg.norm(centered1, axis=1).mean()
+        scale = (
+            np.linalg.norm(centered2, axis=1).mean()
+            / np.linalg.norm(centered1, axis=1).mean()
+        )
         cross_cov = np.dot(centered1.T, centered2)
         u, _, vt = np.linalg.svd(cross_cov)
         rotation_m = np.dot(vt.T, u.T)
@@ -384,7 +415,9 @@ class CdxmlUploadWidget(ipw.VBox):
         return np.array([[0, miny - 7.5, 0], [0, maxy + 7.5, 0]])
 
     # ---------------- CDXML analysis ----------------
-    def extract_crossing_and_atom_positions(self, cdxml_content: str) -> Tuple[np.ndarray, np.ndarray, bool]:
+    def extract_crossing_and_atom_positions(
+        self, cdxml_content: str
+    ) -> Tuple[np.ndarray, np.ndarray, bool]:
         """Extract crossing points and atom positions from CDXML."""
         root = ET.fromstring(cdxml_content)
 
@@ -406,8 +439,15 @@ class CdxmlUploadWidget(ipw.VBox):
             if bond is not None:
                 s, e = bond.get("B"), bond.get("E")
                 if s in atom_id_map and e in atom_id_map:
-                    s_pos, e_pos = atom_positions[atom_id_map[s]], atom_positions[atom_id_map[e]]
-                    midpoint = ((s_pos[0] + e_pos[0]) / 2, (s_pos[1] + e_pos[1]) / 2, 0.0)
+                    s_pos, e_pos = (
+                        atom_positions[atom_id_map[s]],
+                        atom_positions[atom_id_map[e]],
+                    )
+                    midpoint = (
+                        (s_pos[0] + e_pos[0]) / 2,
+                        (s_pos[1] + e_pos[1]) / 2,
+                        0.0,
+                    )
                     crossing_points.append(midpoint)
         crossing_points = np.array(crossing_points)
 
@@ -446,7 +486,9 @@ class CdxmlUploadWidget(ipw.VBox):
         Align, trim, and optionally replicate atoms along the periodic direction.
         Restores hydrogens lost during trimming using original geometry.
         """
-        assert crossing_points.shape == (2, 3), "crossing_points must be a 2x3 NumPy array."
+        assert crossing_points.shape == (2, 3), (
+            "crossing_points must be a 2x3 NumPy array."
+        )
 
         vector = crossing_points[1] - crossing_points[0]
         norm_vector = np.linalg.norm(vector)
@@ -516,10 +558,18 @@ class CdxmlUploadWidget(ipw.VBox):
         else:
             replicated_atoms = bounded_atoms.copy()
             for ni in range(1, n_units):
-                shifted = bounded_atoms.get_positions() + np.array([ni * norm_vector, 0, 0])
-                replicated_atoms += ase.Atoms(bounded_atoms.get_chemical_symbols(), positions=shifted)
-            shifted_head = head_atoms.get_positions() + np.array([(n_units - 1) * norm_vector, 0, 0])
-            replicated_atoms += ase.Atoms(head_atoms.get_chemical_symbols(), positions=shifted_head)
+                shifted = bounded_atoms.get_positions() + np.array(
+                    [ni * norm_vector, 0, 0]
+                )
+                replicated_atoms += ase.Atoms(
+                    bounded_atoms.get_chemical_symbols(), positions=shifted
+                )
+            shifted_head = head_atoms.get_positions() + np.array(
+                [(n_units - 1) * norm_vector, 0, 0]
+            )
+            replicated_atoms += ase.Atoms(
+                head_atoms.get_chemical_symbols(), positions=shifted_head
+            )
             replicated_atoms += tail_atoms
             atoms_final = replicated_atoms
 
