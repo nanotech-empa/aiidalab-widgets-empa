@@ -296,6 +296,42 @@ class CdxmlUploadWidget(ipw.VBox):
                     pos.append(c + length * v)
                     sym.append("H")
 
+            # --- Oxygen or Nitrogen (improved geometry) ---
+            if el in ("O", "N"):
+                v_sum = np.sum(neighbors, axis=0) if neighbors else np.zeros(3)
+                base_dir = normalize(-v_sum) if np.linalg.norm(v_sum) > 1e-6 else np.array([0, 0, 1])
+
+                # --- Single hydrogen (OH, NH) ---
+                if nH == 1:
+                    if el == "O" and len(neighbors) == 1:
+                        # OH: tilt the H about 35° out of the opposite direction (~105° angle)
+                        v = neighbors[0]
+                        # Keep hydrogen roughly in the same molecular plane
+                        rot_axis = np.array([0, 0, 1])
+                        if np.allclose(np.abs(np.dot(v, rot_axis)), 1.0):
+                            rot_axis = np.array([1, 0, 0])
+                        dirs = [rotate_vector(-v, rot_axis, math.radians(35))]
+                        add_H(dirs, 0.98)
+                    else:
+                        # Default for NH etc.
+                        add_H([base_dir], 1.00 if el == "N" else 0.98)
+                    continue
+
+                # --- Two hydrogens (H2O, NH2) ---
+                if nH == 2:
+                    theta = math.radians(104.5 if el == "O" else 107.0)
+                    rot_axis = np.array([0, 0, 1])
+                    if np.allclose(np.abs(np.dot(base_dir, rot_axis)), 1.0):
+                        rot_axis = np.array([1, 0, 0])
+                    dirs = [
+                        rotate_vector(base_dir, rot_axis, math.radians(a))
+                        for a in (-theta / 2, theta / 2)
+                    ]
+                    add_H(dirs, 0.98 if el == "O" else 1.00)
+                    continue
+
+
+            # --- Other heteroatoms (unchanged behaviour) ---
             if el != "C":
                 avg = (
                     normalize(-np.sum(neighbors, axis=0))
@@ -304,6 +340,8 @@ class CdxmlUploadWidget(ipw.VBox):
                 )
                 add_H([avg], 1.01)
                 continue
+
+            # --- Carbon atoms (original logic, untouched) ---
 
             # CH3
             if nH == 3 and len(neighbors) == 1:
@@ -382,6 +420,7 @@ class CdxmlUploadWidget(ipw.VBox):
             if nH == 1:
                 avg = normalize(-np.sum(neighbors, axis=0))
                 add_H([avg], 1.09)
+
 
         mol = Atoms(symbols=sym, positions=pos)
         msg = "✅ Ready to create the structure"
