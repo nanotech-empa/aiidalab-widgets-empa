@@ -299,7 +299,11 @@ class CdxmlUploadWidget(ipw.VBox):
             # --- Oxygen or Nitrogen (improved geometry) ---
             if el in ("O", "N"):
                 v_sum = np.sum(neighbors, axis=0) if neighbors else np.zeros(3)
-                base_dir = normalize(-v_sum) if np.linalg.norm(v_sum) > 1e-6 else np.array([0, 0, 1])
+                base_dir = (
+                    normalize(-v_sum)
+                    if np.linalg.norm(v_sum) > 1e-6
+                    else np.array([0, 0, 1])
+                )
 
                 # --- Single hydrogen (OH, NH) ---
                 if nH == 1:
@@ -329,7 +333,6 @@ class CdxmlUploadWidget(ipw.VBox):
                     ]
                     add_H(dirs, 0.98 if el == "O" else 1.00)
                     continue
-
 
             # --- Other heteroatoms (unchanged behaviour) ---
             if el != "C":
@@ -420,7 +423,6 @@ class CdxmlUploadWidget(ipw.VBox):
             if nH == 1:
                 avg = normalize(-np.sum(neighbors, axis=0))
                 add_H([avg], 1.09)
-
 
         mol = Atoms(symbols=sym, positions=pos)
         msg = "✅ Ready to create the structure"
