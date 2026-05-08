@@ -76,6 +76,11 @@ class CdxmlUploadWidget(ipw.VBox):
 
         # --- Additional widgets ---
         self.nunits = ipw.Text(description="N units", value="Infinite", disabled=True)
+        self.use_clever_hydrogenation = ipw.Checkbox(
+            description="Use clever hydrogenation",
+            value=True,
+            indent=False,
+        )
         self.create_button = ipw.Button(
             description="Create model", button_style="success"
         )
@@ -95,6 +100,7 @@ class CdxmlUploadWidget(ipw.VBox):
             children=[
                 self.file_upload,
                 self.nunits,
+                self.use_clever_hydrogenation,
                 supported_formats,
                 self.create_button,
                 self.output_message,
@@ -111,6 +117,12 @@ class CdxmlUploadWidget(ipw.VBox):
     # ---------------- Event handlers ----------------
     def _on_file_upload(self, change=None) -> None:
         """Handle file upload and convert CDXML to ASE Atoms."""
+        upload_value = self.file_upload.value
+        if change is not None:
+            upload_value = change.get("new", upload_value)
+        if not upload_value:
+            return
+
         self.nunits.value = "Infinite"
         self.nunits.disabled = True
 
@@ -127,9 +139,10 @@ class CdxmlUploadWidget(ipw.VBox):
             self.output_message.value, self.atoms, self.whole_atoms = (
                 self.cdxml_to_ase_from_string(cdxml_content)
             )
-            self.crossing_points, self.cdxml_atoms, self.nunits.disabled = (
+            self.crossing_points, self.cdxml_atoms, is_not_periodic = (
                 self.extract_crossing_and_atom_positions(cdxml_content)
             )
+            self.nunits.disabled = bool(is_not_periodic)
         except ValueError as exc:
             self.output_message.value = f"Error: {exc}"
         except Exception as exc:
@@ -147,8 +160,14 @@ class CdxmlUploadWidget(ipw.VBox):
             crossing_points = self.transform_points(
                 self.cdxml_atoms, atoms.positions, self.crossing_points
             )
+            source_atoms = (
+                self.whole_atoms if self.use_clever_hydrogenation.value else self.atoms
+            )
             atoms = self.align_and_trim_atoms(
-                self.whole_atoms, np.array(crossing_points), units=self.nunits.value
+                source_atoms,
+                np.array(crossing_points),
+                units=self.nunits.value,
+                original_atoms=source_atoms,
             )
         else:
             self.output_message.value = "Error: No 'crossing points' found."
@@ -158,12 +177,50 @@ class CdxmlUploadWidget(ipw.VBox):
             extra_cell = 15.0
             atoms.cell = np.ptp(atoms.positions, axis=0) + extra_cell
             atoms.center()
+            atoms.pbc = False
 
-        if self.nunits.value == "Infinite":
+        if not self.nunits.disabled and self.nunits.value == "Infinite":
             atoms.pbc = True
 
+        if not self.use_clever_hydrogenation.value:
+            self.output_message.value, atoms = self.add_safe_hydrogen_atoms(atoms)
+        else:
+            self.output_message.value = "✅ 3D structure created"
+
         self.structure = atoms
-        self.output_message.value = "✅ 3D structure created"
+
+    @staticmethod
+    def add_safe_hydrogen_atoms(atoms: Atoms) -> Tuple[str, Atoms]:
+        """Add one H to C atoms with fewer than three neighbors."""
+        neighbor_list = NeighborList(
+            [covalent_radii[atom.number] for atom in atoms],
+            bothways=True,
+            self_interaction=False,
+        )
+        neighbor_list.update(atoms)
+
+        need_hydrogen = [
+            atom.index
+            for atom in atoms
+            if atom.symbol == "C"
+            and len(neighbor_list.get_neighbors(atom.index)[0]) < 3
+        ]
+
+        for index in need_hydrogen:
+            vec = np.zeros(3)
+            indices, offsets = neighbor_list.get_neighbors(atoms[index].index)
+            for i, offset in zip(indices, offsets):
+                vec += -atoms[index].position + (
+                    atoms.positions[i] + np.dot(offset, atoms.get_cell())
+                )
+            vec_norm = np.linalg.norm(vec)
+            if vec_norm > 1e-12:
+                position = -vec / vec_norm * 1.1 + atoms[index].position
+            else:
+                position = atoms[index].position + np.array([0.0, 0.0, 1.1])
+            atoms.append(ase.Atom("H", position))
+
+        return f"Added missing Hydrogen atoms (safe hydrogenation): {need_hydrogen}.", atoms
 
     # ---------------- Core conversion logic ----------------
     @staticmethod
@@ -493,10 +550,17 @@ class CdxmlUploadWidget(ipw.VBox):
         crossing_points = np.array(crossing_points)
 
         brackets = []
-        for g in root.findall(".//graphic[@BracketType='Square']"):
-            if "BoundingBox" in g.attrib:
-                x_min, y_min, x_max, y_max = map(float, g.attrib["BoundingBox"].split())
-                brackets.append(((x_min + x_max) / 2, (y_min + y_max) / 2, 0.0))
+        for graphic in root.iter("graphic"):
+            if graphic.attrib.get("BracketType") != "Square":
+                continue
+            if "BoundingBox" not in graphic.attrib:
+                continue
+
+            coords = [float(value) for value in graphic.attrib["BoundingBox"].split()]
+            if len(coords) != 4:
+                continue
+            x_min, y_min, x_max, y_max = coords
+            brackets.append(((x_min + x_max) / 2, (y_min + y_max) / 2, 0.0))
 
         if not brackets:
             return self.max_extension_points(atom_positions), atom_positions, True
@@ -504,14 +568,22 @@ class CdxmlUploadWidget(ipw.VBox):
         if len(brackets) == 2:
             brackets = np.array(brackets)
             vector = brackets[1] - brackets[0]
-            unit_vec = vector[:2] / np.linalg.norm(vector[:2])
+            norm = np.linalg.norm(vector[:2])
+            if norm < 1e-12:
+                return None, atom_positions, True
+            unit_vec = vector[:2] / norm
             if unit_vec[0] < 0 or unit_vec[1] < 0:
                 unit_vec = -unit_vec
             for i in range(len(crossing_points)):
                 for j in range(i + 1, len(crossing_points)):
                     v = crossing_points[j][:2] - crossing_points[i][:2]
-                    if np.dot(v / np.linalg.norm(v), unit_vec) > 0.99:
+                    norm = np.linalg.norm(v)
+                    if norm < 1e-12:
+                        continue
+                    if np.dot(v / norm, unit_vec) > 0.99:
                         return crossing_points[[i, j]], atom_positions, False
+
+            return brackets, atom_positions, False
 
         return None, atom_positions, True
 
