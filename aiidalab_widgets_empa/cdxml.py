@@ -1,8 +1,10 @@
+"""Import molecular and periodic structures from ChemDraw CDXML files."""
+
 from __future__ import annotations
 
+import html
 import math
 import xml.etree.ElementTree as ET
-from typing import List, Optional, Tuple
 
 import ase
 import ipywidgets as ipw
@@ -11,12 +13,7 @@ import traitlets as tr
 from ase import Atoms
 from ase.data import covalent_radii
 from ase.neighborlist import NeighborList
-from scipy.optimize import least_squares
-
-"""Widget to convert CDXML to planar structures"""
-
-"""Widget to convert CDXML files into planar ASE.Atoms structures with alignment,
-trimming, hydrogen restoration, and optional replication along the periodic axis."""
+from scipy.optimize import least_squares, linear_sum_assignment
 
 
 # ---------------- Utility functions ----------------
@@ -62,8 +59,8 @@ def _signed_area(points: np.ndarray) -> float:
 
 
 def _bounded_faces(
-    positions: np.ndarray, edges: List[Tuple[int, int]]
-) -> List[List[int]]:
+    positions: np.ndarray, edges: list[tuple[int, int]]
+) -> list[list[int]]:
     """Find bounded faces in an existing straight-line planar embedding."""
     adjacency = {index: [] for index in range(len(positions))}
     for first, second in edges:
@@ -151,7 +148,7 @@ def _segments_properly_cross(
     )
 
 
-def _has_bond_crossings(positions: np.ndarray, edges: List[Tuple[int, int]]) -> bool:
+def _has_bond_crossings(positions: np.ndarray, edges: list[tuple[int, int]]) -> bool:
     """Check a straight-line graph embedding for non-adjacent bond crossings."""
     for edge_index, (first, second) in enumerate(edges):
         for third, fourth in edges[edge_index + 1 :]:
@@ -164,15 +161,62 @@ def _has_bond_crossings(positions: np.ndarray, edges: List[Tuple[int, int]]) -> 
     return False
 
 
+def _top_level_cdxml_fragments(root: ET.Element) -> list[ET.Element]:
+    """Return chemical fragments that are not nested in another fragment."""
+    parents = {child: parent for parent in root.iter() for child in parent}
+    fragments = []
+    for fragment in root.iter("fragment"):
+        parent = parents.get(fragment)
+        while parent is not None and parent.tag != "fragment":
+            parent = parents.get(parent)
+        if parent is not None:
+            continue
+        if any(node.get("p") for node in fragment.iter("n")):
+            fragments.append(fragment)
+    return fragments
+
+
+def _element_bounding_box(
+    element: ET.Element,
+) -> tuple[float, float, float, float] | None:
+    """Return an element bounding box, falling back to its point position."""
+    if bounding_box := element.get("BoundingBox"):
+        coordinates = [float(value) for value in bounding_box.split()]
+        if len(coordinates) == 4:
+            first_x, first_y, second_x, second_y = coordinates
+            return (
+                min(first_x, second_x),
+                min(first_y, second_y),
+                max(first_x, second_x),
+                max(first_y, second_y),
+            )
+    if position := element.get("p"):
+        coordinates = [float(value) for value in position.split()]
+        if len(coordinates) >= 2:
+            return (coordinates[0], coordinates[1], coordinates[0], coordinates[1])
+    return None
+
+
+def _rectangle_distance(
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
+) -> float:
+    """Return the shortest distance between two axis-aligned rectangles."""
+    first_min_x, first_min_y, first_max_x, first_max_y = first
+    second_min_x, second_min_y, second_max_x, second_max_y = second
+    delta_x = max(first_min_x - second_max_x, second_min_x - first_max_x, 0.0)
+    delta_y = max(first_min_y - second_max_y, second_min_y - first_max_y, 0.0)
+    return math.hypot(delta_x, delta_y)
+
+
 # ---------------- Main Widget ----------------
 class CdxmlUploadWidget(ipw.VBox):
     """Widget for uploading CDXML files and converting them into ASE.Atoms structures."""
 
     structure = tr.Instance(ase.Atoms, allow_none=True)
+    _maximum_label_distance_in_bonds = 2.5
 
-    def __init__(
-        self, title: str = "CDXML to GNR", description: str = "Upload Structure"
-    ):
+    def __init__(self, title: str = "CDXML", description: str = "Upload CDXML"):
         self.title = title
 
         # --- File upload widget ---
@@ -185,9 +229,17 @@ class CdxmlUploadWidget(ipw.VBox):
         self.file_upload.observe(self._on_file_upload, names="value")
 
         # --- Additional widgets ---
+        self.structure_selector = ipw.Dropdown(
+            description="Structure",
+            options=(),
+            disabled=True,
+            layout={"display": "none", "width": "initial"},
+            style={"description_width": "initial"},
+        )
+        self.structure_selector.observe(self._on_structure_selection, names="value")
         self.nunits = ipw.Text(description="N units", value="Infinite", disabled=True)
         self.use_clever_hydrogenation = ipw.Checkbox(
-            description="Use clever hydrogenation",
+            description="Infer implicit hydrogens from bond orders",
             value=True,
             indent=False,
         )
@@ -214,6 +266,7 @@ class CdxmlUploadWidget(ipw.VBox):
         super().__init__(
             children=[
                 self.file_upload,
+                self.structure_selector,
                 self.nunits,
                 self.use_clever_hydrogenation,
                 self.symmetrize_geometry,
@@ -224,40 +277,264 @@ class CdxmlUploadWidget(ipw.VBox):
         )
 
         # --- Internal state ---
-        self.structure: Optional[ase.Atoms] = None
-        self.crossing_points: Optional[np.ndarray] = None
-        self.cdxml_atoms: Optional[np.ndarray] = None
-        self.atoms: Optional[ase.Atoms] = None
-        self.whole_atoms: Optional[ase.Atoms] = None
+        self.structure: ase.Atoms | None = None
+        self.crossing_points: np.ndarray | None = None
+        self.cdxml_atoms: np.ndarray | None = None
+        self.atoms: ase.Atoms | None = None
+        self.whole_atoms: ase.Atoms | None = None
         self._cdxml_content = None
-        self._conversion_message = ""
+        self._geometry_message = ""
+        self._updating_structure_selector = False
 
     # ---------------- Event handlers ----------------
+    @classmethod
+    def _cdxml_structure_options(
+        cls, cdxml_content: str | bytes
+    ) -> list[tuple[str, int]]:
+        """Find top-level structures and associate nearby captions one-to-one."""
+        root = ET.fromstring(cdxml_content)
+        fragments = _top_level_cdxml_fragments(root)
+        if not fragments:
+            if any(node.get("p") for node in root.iter("n")):
+                return [("Structure 1", 0)]
+            return []
+
+        parents = {child: parent for parent in root.iter() for child in parent}
+        captions = []
+        for text_element in root.iter("t"):
+            parent = parents.get(text_element)
+            is_chemical_label = False
+            while parent is not None:
+                if parent.tag in {"fragment", "n"}:
+                    is_chemical_label = True
+                    break
+                parent = parents.get(parent)
+            if is_chemical_label:
+                continue
+            text = "".join(text_element.itertext()).strip()
+            bounding_box = _element_bounding_box(text_element)
+            if text and bounding_box is not None:
+                captions.append((text, bounding_box))
+
+        root_bond_length = None
+        try:
+            root_bond_length = float(root.get("BondLength", ""))
+        except ValueError:
+            pass
+
+        fragment_boxes = []
+        fragment_scales: list[float | None] = []
+        for fragment in fragments:
+            atom_positions = {
+                node.get("id"): np.asarray(
+                    [float(value) for value in node.get("p", "").split()[:2]]
+                )
+                for node in fragment.iter("n")
+                if node.get("id") and len(node.get("p", "").split()) >= 2
+            }
+            points = np.asarray(list(atom_positions.values()))
+            fragment_boxes.append(
+                (
+                    float(np.min(points[:, 0])),
+                    float(np.min(points[:, 1])),
+                    float(np.max(points[:, 0])),
+                    float(np.max(points[:, 1])),
+                )
+            )
+            bond_lengths = [
+                np.linalg.norm(
+                    atom_positions[bond.get("B")] - atom_positions[bond.get("E")]
+                )
+                for bond in fragment.iter("b")
+                if bond.get("B") in atom_positions and bond.get("E") in atom_positions
+            ]
+            scale = float(np.median(bond_lengths)) if bond_lengths else None
+            fragment_scales.append(scale if scale and scale > 0.0 else None)
+
+        available_scales = [scale for scale in fragment_scales if scale is not None]
+        fallback_scale = root_bond_length
+        if not fallback_scale or fallback_scale <= 0.0:
+            fallback_scale = (
+                float(np.median(available_scales)) if available_scales else 1.0
+            )
+        resolved_fragment_scales = [
+            scale if scale is not None else fallback_scale for scale in fragment_scales
+        ]
+
+        assigned_labels: list[str | None] = [None] * len(fragments)
+        if captions:
+            normalized_distances = np.asarray(
+                [
+                    [
+                        _rectangle_distance(fragment_box, caption_box) / scale
+                        for _, caption_box in captions
+                    ]
+                    for fragment_box, scale in zip(
+                        fragment_boxes, resolved_fragment_scales
+                    )
+                ]
+            )
+            unmatched_cost = cls._maximum_label_distance_in_bonds
+            costs = np.full(
+                (len(fragments), len(captions) + len(fragments)),
+                unmatched_cost,
+            )
+            costs[:, : len(captions)] = normalized_distances
+            rows, columns = linear_sum_assignment(costs)
+            for row, column in zip(rows, columns):
+                if (
+                    column < len(captions)
+                    and normalized_distances[row, column] <= unmatched_cost
+                ):
+                    assigned_labels[row] = captions[column][0]
+
+        label_counts = {
+            label: assigned_labels.count(label)
+            for label in assigned_labels
+            if label is not None
+        }
+        options = []
+        for index, label in enumerate(assigned_labels, start=1):
+            if label is None:
+                display_label = f"Structure {index}"
+            elif label_counts[label] > 1:
+                display_label = f"{label} — Structure {index}"
+            else:
+                display_label = label
+            options.append((display_label, index - 1))
+        return options
+
+    @staticmethod
+    def _select_cdxml_structure(
+        cdxml_content: str | bytes, structure_index: int
+    ) -> str | bytes:
+        """Return CDXML containing only the selected top-level structure."""
+        root = ET.fromstring(cdxml_content)
+        fragments = _top_level_cdxml_fragments(root)
+        if not fragments:
+            if structure_index == 0 and any(node.get("p") for node in root.iter("n")):
+                return cdxml_content
+            raise ValueError("No chemical structure was found in the CDXML file.")
+        if not 0 <= structure_index < len(fragments):
+            raise ValueError("The selected CDXML structure is unavailable.")
+        if len(fragments) == 1:
+            return cdxml_content
+
+        selected_fragment = fragments[structure_index]
+        selected_ids = {
+            element.get("id")
+            for element in selected_fragment.iter()
+            if element.get("id")
+        }
+        selected_bond_ids = {
+            bond.get("id") for bond in selected_fragment.iter("b") if bond.get("id")
+        }
+
+        parents = {child: parent for parent in root.iter() for child in parent}
+        for fragment in fragments:
+            if fragment is not selected_fragment:
+                parents[fragment].remove(fragment)
+
+        selected_graphic_ids = set()
+        parents = {child: parent for parent in root.iter() for child in parent}
+        for group in list(root.iter("bracketedgroup")):
+            object_ids = set(group.get("BracketedObjectIDs", "").split())
+            crossing_bond_ids = {
+                crossing.get("BondID") for crossing in group.iter("crossingbond")
+            }
+            if object_ids & selected_ids or crossing_bond_ids & selected_bond_ids:
+                selected_graphic_ids.update(
+                    attachment.get("GraphicID")
+                    for attachment in group.findall("./bracketattachment")
+                    if attachment.get("GraphicID")
+                )
+            else:
+                parents[group].remove(group)
+
+        parents = {child: parent for parent in root.iter() for child in parent}
+        for graphic in list(root.iter("graphic")):
+            is_unused_bracket = (
+                graphic.get("BracketType") is not None
+                and graphic.get("id") not in selected_graphic_ids
+            )
+            is_unused_electron = graphic.get("SymbolType") == "Electron" and not any(
+                representation.get("object") in selected_ids
+                for representation in graphic.iter("represent")
+            )
+            if is_unused_bracket or is_unused_electron:
+                parents[graphic].remove(graphic)
+
+        return ET.tostring(root, encoding="utf-8")
+
+    def _configure_structure_selector(self) -> None:
+        """Populate the structure selector for the uploaded document."""
+        if self._cdxml_content is None:
+            options = []
+        else:
+            options = self._cdxml_structure_options(self._cdxml_content)
+        self._updating_structure_selector = True
+        try:
+            self.structure_selector.options = options
+            self.structure_selector.value = options[0][1] if options else None
+            self.structure_selector.disabled = len(options) <= 1
+            self.structure_selector.layout.display = (
+                "flex" if len(options) > 1 else "none"
+            )
+        finally:
+            self._updating_structure_selector = False
+
+    def _selected_cdxml_content(self) -> str | bytes:
+        """Return the uploaded CDXML restricted to the current selection."""
+        if self._cdxml_content is None:
+            raise ValueError("No CDXML file has been uploaded.")
+        if not self.structure_selector.options:
+            return self._cdxml_content
+        structure_index = self.structure_selector.value
+        if structure_index is None:
+            structure_index = 0
+        return self._select_cdxml_structure(self._cdxml_content, structure_index)
+
+    def _on_structure_selection(self, change=None) -> None:
+        """Reconvert the document when the selected structure changes."""
+        if self._updating_structure_selector or self._cdxml_content is None:
+            return
+        if change is not None and change.get("new") is None:
+            return
+        self.structure = None
+        self.nunits.value = "Infinite"
+        self.nunits.disabled = True
+        self._convert_uploaded_cdxml()
+
     def _convert_uploaded_cdxml(self) -> bool:
         """Convert the stored CDXML with the currently selected geometry options."""
         if self._cdxml_content is None:
             self.output_message.value = "Error: No CDXML file has been uploaded."
             return False
         try:
-            self._conversion_message, self.atoms, self.whole_atoms = (
+            selected_content = self._selected_cdxml_content()
+            self._geometry_message, self.atoms, self.whole_atoms = (
                 self.cdxml_to_ase_from_string(
-                    self._cdxml_content,
+                    selected_content,
                     symmetrize=self.symmetrize_geometry.value,
                 )
             )
             self.crossing_points, self.cdxml_atoms, is_not_periodic = (
                 self.extract_crossing_and_atom_positions(
-                    self._cdxml_content,
+                    selected_content,
                     atom_positions_override=self.atoms.positions,
                 )
             )
             self.nunits.disabled = bool(is_not_periodic)
-            self.output_message.value = self._conversion_message
+            self.output_message.value = (
+                f"Ready to create the structure. {self._geometry_message}"
+            )
             return True
         except ValueError as exc:
-            self.output_message.value = f"Error: {exc}"
-        except Exception as exc:
-            self.output_message.value = f"Unexpected error: {exc}"
+            self.output_message.value = f"Error: {html.escape(str(exc))}"
+        # A file-upload callback should report unexpected malformed input in the
+        # widget instead of interrupting the notebook event loop.
+        except Exception as exc:  # noqa: BLE001
+            self.output_message.value = f"Unexpected error: {html.escape(str(exc))}"
         return False
 
     def _on_file_upload(self, change=None) -> None:
@@ -272,13 +549,34 @@ class CdxmlUploadWidget(ipw.VBox):
         self.nunits.disabled = True
 
         def get_unified_representation(value):
-            """Compatibility wrapper for ipywidgets 7.x and 8.x."""
-            try:
-                return [(fname, item["content"]) for fname, item in value.items()]
-            except AttributeError:
-                return [(f["name"], f.content.tobytes()) for f in value]
+            """Return name/content pairs for ipywidgets 7 and 8 payloads."""
+            if isinstance(value, dict):
+                return [
+                    (filename, bytes(item["content"]))
+                    for filename, item in value.items()
+                ]
+
+            files = []
+            for item in value:
+                if isinstance(item, dict):
+                    files.append((item["name"], bytes(item["content"])))
+                else:
+                    files.append((item["name"], item.content.tobytes()))
+            return files
 
         _, self._cdxml_content = get_unified_representation(upload_value)[0]
+        self.structure = None
+        try:
+            self._configure_structure_selector()
+        except Exception:  # noqa: BLE001
+            # Conversion below reports malformed CDXML consistently in the widget.
+            self._updating_structure_selector = True
+            try:
+                self.structure_selector.options = ()
+                self.structure_selector.disabled = True
+                self.structure_selector.layout.display = "none"
+            finally:
+                self._updating_structure_selector = False
         self._convert_uploaded_cdxml()
 
     def _on_button_click(self, _=None) -> None:
@@ -292,12 +590,20 @@ class CdxmlUploadWidget(ipw.VBox):
         atoms = self.atoms.copy()
 
         if self.crossing_points is not None:
+            if self.cdxml_atoms is None:
+                self.output_message.value = (
+                    "Error: CDXML atom positions are unavailable."
+                )
+                return
             crossing_points = self.transform_points(
                 self.cdxml_atoms, atoms.positions, self.crossing_points
             )
             source_atoms = (
                 self.whole_atoms if self.use_clever_hydrogenation.value else self.atoms
             )
+            if source_atoms is None:
+                self.output_message.value = "Error: Converted atoms are unavailable."
+                return
             atoms = self.align_and_trim_atoms(
                 source_atoms,
                 np.array(crossing_points),
@@ -317,21 +623,16 @@ class CdxmlUploadWidget(ipw.VBox):
         if not self.nunits.disabled and self.nunits.value == "Infinite":
             atoms.pbc = [True, False, False]
 
+        messages = ["Structure created.", self._geometry_message]
         if not self.use_clever_hydrogenation.value:
             hydrogen_message, atoms = self.add_safe_hydrogen_atoms(atoms)
-            self.output_message.value = (
-                f"✅ 3D structure created. {self._conversion_message} "
-                f"{hydrogen_message}"
-            )
-        else:
-            self.output_message.value = (
-                f"✅ 3D structure created. {self._conversion_message}"
-            )
+            messages.append(hydrogen_message)
+        self.output_message.value = " ".join(messages)
 
         self.structure = atoms
 
     @staticmethod
-    def add_safe_hydrogen_atoms(atoms: Atoms) -> Tuple[str, Atoms]:
+    def add_safe_hydrogen_atoms(atoms: Atoms) -> tuple[str, Atoms]:
         """Add one H to C atoms with fewer than three neighbors."""
         neighbor_list = NeighborList(
             [covalent_radii[atom.number] for atom in atoms],
@@ -370,8 +671,8 @@ class CdxmlUploadWidget(ipw.VBox):
     @staticmethod
     def symmetrize_carbon_network(
         positions: np.ndarray,
-        symbols: List[str],
-        bonds: List[Tuple[int, int]],
+        symbols: list[str],
+        bonds: list[tuple[int, int]],
         target_cc_length: float = 1.43,
         minimum_cc_length: float = 1.35,
         maximum_cc_length: float = 1.60,
@@ -428,9 +729,14 @@ class CdxmlUploadWidget(ipw.VBox):
 
         def residual(flat_positions):
             current = flat_positions.reshape((-1, 2))
-            values = [
-                (np.linalg.norm(current[second] - current[first]) - target_cc_length)
-                / 0.04
+            values: list[float] = [
+                float(
+                    (
+                        np.linalg.norm(current[second] - current[first])
+                        - target_cc_length
+                    )
+                    / 0.04
+                )
                 for first, second in carbon_edges
             ]
             for center, first, second in angle_terms:
@@ -440,7 +746,7 @@ class CdxmlUploadWidget(ipw.VBox):
                     second_vector
                 )
                 cosine = np.dot(first_vector, second_vector) / max(denominator, 1.0e-12)
-                values.append(math.sqrt(0.10) * (cosine + 0.5) / 0.15)
+                values.append(float(math.sqrt(0.10) * (cosine + 0.5) / 0.15))
 
             # Keep the user's global layout while allowing local cleanup.
             values.extend((math.sqrt(0.10) * (current - original) / 0.20).ravel())
@@ -518,10 +824,10 @@ class CdxmlUploadWidget(ipw.VBox):
 
     @staticmethod
     def cdxml_to_ase_from_string(
-        cdxml_content: str,
+        cdxml_content: str | bytes,
         target_cc_length: float = 1.43,
         symmetrize: bool = False,
-    ) -> Tuple[str, Atoms, Atoms]:
+    ) -> tuple[str, Atoms, Atoms]:
         """
         Convert CDXML content (string) into ASE Atoms objects:
         one bare molecule (no hydrogens) and one with hydrogens.
@@ -671,9 +977,11 @@ class CdxmlUploadWidget(ipw.VBox):
             neighbors = [normalize(atoms[n]["pos"] - c) for n, _ in conn[aid]]
             orders = [o for _, o in conn[aid]]
 
-            def add_H(vecs: List[np.ndarray], length: float = 1.09):
+            def add_H(
+                vecs: list[np.ndarray], length: float = 1.09, center: np.ndarray = c
+            ):
                 for v in vecs:
-                    pos.append(c + length * v)
+                    pos.append(center + length * v)
                     sym.append("H")
 
             # --- Oxygen or Nitrogen (improved geometry) ---
@@ -805,14 +1113,14 @@ class CdxmlUploadWidget(ipw.VBox):
                 add_H([avg], 1.09)
 
         mol = Atoms(symbols=sym, positions=pos)
-        msg = f"✅ Ready to create the structure. {geometry_message}"
+        msg = geometry_message
         return msg, bare_mol, mol
 
     # ---------------- Geometry utilities ----------------
     @staticmethod
     def transform_points(
         set1: np.ndarray, set2: np.ndarray, points: np.ndarray
-    ) -> List[List[float]]:
+    ) -> list[list[float]]:
         """Transform points based on scaling and rotation aligning set1→set2."""
         centroid1, centroid2 = np.mean(set1, axis=0), np.mean(set2, axis=0)
         centered1, centered2 = set1 - centroid1, set2 - centroid2
@@ -838,9 +1146,9 @@ class CdxmlUploadWidget(ipw.VBox):
     # ---------------- CDXML analysis ----------------
     def extract_crossing_and_atom_positions(
         self,
-        cdxml_content: str,
-        atom_positions_override: Optional[np.ndarray] = None,
-    ) -> Tuple[Optional[np.ndarray], np.ndarray, bool]:
+        cdxml_content: str | bytes,
+        atom_positions_override: np.ndarray | None = None,
+    ) -> tuple[np.ndarray | None, np.ndarray, bool]:
         """Extract robust periodic boundaries and atom positions from CDXML.
 
         ChemDraw may serialize the right bracket before the left bracket. Crossing
@@ -1028,8 +1336,8 @@ class CdxmlUploadWidget(ipw.VBox):
     def align_and_trim_atoms(
         atoms: Atoms,
         crossing_points: np.ndarray,
-        units: Optional[str] = None,
-        original_atoms: Optional[Atoms] = None,
+        units: str | None = None,
+        original_atoms: Atoms | None = None,
     ) -> Atoms:
         """
         Align, trim, and optionally replicate atoms along the periodic direction.
@@ -1097,10 +1405,13 @@ class CdxmlUploadWidget(ipw.VBox):
         if restored_positions:
             bounded_atoms += ase.Atoms(restored_symbols, positions=restored_positions)
 
-        try:
-            n_units = int(units)
-        except (TypeError, ValueError):
+        if units is None:
             n_units = None
+        else:
+            try:
+                n_units = int(units)
+            except ValueError:
+                n_units = None
 
         if n_units is None or n_units < 1:
             atoms_final = bounded_atoms
