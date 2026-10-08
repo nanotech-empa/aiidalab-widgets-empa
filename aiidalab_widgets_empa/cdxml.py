@@ -15,6 +15,8 @@ from ase.data import covalent_radii
 from ase.neighborlist import NeighborList
 from scipy.optimize import least_squares, linear_sum_assignment
 
+from .cdxml_rendering import render_cdxml_png, set_png_widget
+
 
 # ---------------- Utility functions ----------------
 def normalize(v: np.ndarray) -> np.ndarray:
@@ -237,6 +239,25 @@ class CdxmlUploadWidget(ipw.VBox):
             style={"description_width": "initial"},
         )
         self.structure_selector.observe(self._on_structure_selection, names="value")
+        self.png_preview = ipw.Image(format="png")
+        self.preview_message = ipw.HTML()
+        self.preview_zoom = ipw.Button(
+            description="Enlarge preview",
+            icon="search-plus",
+            disabled=True,
+            layout={"width": "initial"},
+        )
+        self.preview_zoom.on_click(self._toggle_preview_size)
+        self.preview_box = ipw.VBox(
+            [
+                ipw.HTML("<b>Selected chemical sketch</b>"),
+                self.png_preview,
+                self.preview_zoom,
+                self.preview_message,
+            ],
+            layout={"display": "none"},
+        )
+        self._preview_expanded = False
         self.nunits = ipw.Text(description="N units", value="Infinite", disabled=True)
         self.use_clever_hydrogenation = ipw.Checkbox(
             description="Infer implicit hydrogens from bond orders",
@@ -248,6 +269,7 @@ class CdxmlUploadWidget(ipw.VBox):
             value=False,
             indent=False,
         )
+        self.symmetrize_geometry.observe(self._on_geometry_option_change, names="value")
         self.create_button = ipw.Button(
             description="Create model", button_style="success"
         )
@@ -267,6 +289,7 @@ class CdxmlUploadWidget(ipw.VBox):
             children=[
                 self.file_upload,
                 self.structure_selector,
+                self.preview_box,
                 self.nunits,
                 self.use_clever_hydrogenation,
                 self.symmetrize_geometry,
@@ -283,6 +306,8 @@ class CdxmlUploadWidget(ipw.VBox):
         self.atoms: ase.Atoms | None = None
         self.whole_atoms: ase.Atoms | None = None
         self._cdxml_content = None
+        self._conversion_signature = None
+        self._preview_cdxml = b""
         self._geometry_message = ""
         self._updating_structure_selector = False
 
@@ -494,6 +519,106 @@ class CdxmlUploadWidget(ipw.VBox):
             structure_index = 0
         return self._select_cdxml_structure(self._cdxml_content, structure_index)
 
+    def _update_png_preview(self) -> None:
+        """Show the original selected drawing before creating an atomistic model."""
+        set_png_widget(self.png_preview, b"")
+        self.preview_message.value = ""
+        self.preview_zoom.disabled = True
+        self._preview_expanded = False
+        self.preview_zoom.description = "Enlarge preview"
+        self.preview_zoom.icon = "search-plus"
+        self.preview_box.layout.display = "flex"
+        try:
+            content = self._selected_cdxml_content()
+            if (
+                self.symmetrize_geometry.value
+                and self._conversion_signature is not None
+            ):
+                content = self._cleaned_drawing(content)
+            self._preview_cdxml = (
+                content.encode("utf-8") if isinstance(content, str) else content
+            )
+            set_png_widget(self.png_preview, render_cdxml_png(self._preview_cdxml))
+            self.preview_zoom.disabled = False
+        except Exception as exc:  # noqa: BLE001
+            self.preview_message.value = (
+                f"Sketch preview unavailable: {html.escape(str(exc))}"
+            )
+
+    def _cleaned_drawing(self, content: str | bytes) -> bytes:
+        """Project the exact prepared geometry back into the drawing's scale."""
+        if self.atoms is None:
+            raise ValueError("No prepared geometry is available.")
+        root = ET.fromstring(content)
+        nodes = [node for node in root.iter("n") if node.get("p")]
+        original = np.array(
+            [[*map(float, node.get("p").split()), 0.0] for node in nodes]
+        )
+        updated = np.asarray(
+            self.transform_points(self.atoms.positions, original, self.atoms.positions)
+        )
+        for node, position in zip(nodes, updated):
+            node.set("p", f"{position[0]:.9g} {position[1]:.9g}")
+        bracket_graphics = []
+        corners = []
+        for graphic in root.iter("graphic"):
+            if graphic.get("BracketType") != "Square" or not graphic.get("BoundingBox"):
+                continue
+            coordinates = list(map(float, graphic.get("BoundingBox").split()))
+            if len(coordinates) == 4:
+                bracket_graphics.append(graphic)
+                corners.extend(
+                    [
+                        [coordinates[0], coordinates[1], 0.0],
+                        [coordinates[2], coordinates[3], 0.0],
+                    ]
+                )
+        if corners:
+            transformed = np.asarray(
+                self.transform_points(original, updated, np.asarray(corners))
+            ).reshape((-1, 2, 3))
+            if len(bracket_graphics) == 2 and self.crossing_points is not None:
+                boundaries = np.asarray(
+                    self.transform_points(
+                        self.atoms.positions, updated, self.crossing_points
+                    )
+                )
+                centres = transformed.mean(axis=1)
+                first, second = linear_sum_assignment(
+                    np.linalg.norm(centres[:, None, :] - boundaries[None, :, :], axis=2)
+                )
+                for graphic_index, boundary_index in zip(first, second):
+                    transformed[graphic_index] += (
+                        boundaries[boundary_index] - centres[graphic_index]
+                    )
+            for graphic, pair in zip(bracket_graphics, transformed):
+                graphic.set(
+                    "BoundingBox",
+                    " ".join(f"{value:.9g}" for value in pair[:, :2].ravel()),
+                )
+        return ET.tostring(root, encoding="utf-8")
+
+    def _on_geometry_option_change(self, _=None) -> None:
+        if self._cdxml_content is None:
+            return
+        self.structure = None
+        self._convert_uploaded_cdxml()
+        self._update_png_preview()
+
+    def _toggle_preview_size(self, _=None) -> None:
+        self._preview_expanded = not self._preview_expanded
+        set_png_widget(
+            self.png_preview,
+            bytes(self.png_preview.value),
+            max_side=900 if self._preview_expanded else 300,
+        )
+        self.preview_zoom.description = (
+            "Reduce preview" if self._preview_expanded else "Enlarge preview"
+        )
+        self.preview_zoom.icon = (
+            "search-minus" if self._preview_expanded else "search-plus"
+        )
+
     def _on_structure_selection(self, change=None) -> None:
         """Reconvert the document when the selected structure changes."""
         if self._updating_structure_selector or self._cdxml_content is None:
@@ -504,6 +629,7 @@ class CdxmlUploadWidget(ipw.VBox):
         self.nunits.value = "Infinite"
         self.nunits.disabled = True
         self._convert_uploaded_cdxml()
+        self._update_png_preview()
 
     def _convert_uploaded_cdxml(self) -> bool:
         """Convert the stored CDXML with the currently selected geometry options."""
@@ -512,6 +638,13 @@ class CdxmlUploadWidget(ipw.VBox):
             return False
         try:
             selected_content = self._selected_cdxml_content()
+            signature = (selected_content, self.symmetrize_geometry.value)
+            if signature == self._conversion_signature:
+                return True
+            self._conversion_signature = None
+            self.atoms = self.whole_atoms = self.cdxml_atoms = self.crossing_points = (
+                None
+            )
             self._geometry_message, self.atoms, self.whole_atoms = (
                 self.cdxml_to_ase_from_string(
                     selected_content,
@@ -525,6 +658,7 @@ class CdxmlUploadWidget(ipw.VBox):
                 )
             )
             self.nunits.disabled = bool(is_not_periodic)
+            self._conversion_signature = signature
             self.output_message.value = (
                 f"Ready to create the structure. {self._geometry_message}"
             )
@@ -565,6 +699,7 @@ class CdxmlUploadWidget(ipw.VBox):
             return files
 
         _, self._cdxml_content = get_unified_representation(upload_value)[0]
+        self._conversion_signature = None
         self.structure = None
         try:
             self._configure_structure_selector()
@@ -578,6 +713,7 @@ class CdxmlUploadWidget(ipw.VBox):
             finally:
                 self._updating_structure_selector = False
         self._convert_uploaded_cdxml()
+        self._update_png_preview()
 
     def _on_button_click(self, _=None) -> None:
         """Create the ASE model when 'Create model' button is clicked."""
