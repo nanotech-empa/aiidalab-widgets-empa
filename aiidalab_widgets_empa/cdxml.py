@@ -588,9 +588,19 @@ class CdxmlUploadWidget(ipw.VBox):
                     np.linalg.norm(centres[:, None, :] - boundaries[None, :, :], axis=2)
                 )
                 for graphic_index, boundary_index in zip(first, second):
-                    transformed[graphic_index] += (
-                        boundaries[boundary_index] - centres[graphic_index]
+                    stem = transformed[graphic_index, 1] - transformed[graphic_index, 0]
+                    stem_length = np.linalg.norm(stem)
+                    if stem_length <= 1.0e-12:
+                        continue
+                    tangent = stem / stem_length
+                    displacement = boundaries[boundary_index] - centres[graphic_index]
+                    # A crossing bond fixes the cut line, not the bracket's
+                    # midpoint along that line. Preserve the original graphical
+                    # extent instead of centring the bracket on a chosen bond.
+                    perpendicular = (
+                        displacement - np.dot(displacement, tangent) * tangent
                     )
+                    transformed[graphic_index] += perpendicular
             for graphic, pair in zip(bracket_graphics, transformed):
                 graphic.set(
                     "BoundingBox",

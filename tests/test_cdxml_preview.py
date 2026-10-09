@@ -166,3 +166,52 @@ def test_automatic_ring_double_lines_point_inward():
     image = Image.open(BytesIO(render_cdxml_png(ET.tostring(root))))
     assert image.width > 50 and image.height > 50
     assert np.array(image)[:, :, :3].min() < 50
+
+
+def test_cleanup_moves_brackets_only_perpendicular_to_their_stems():
+    # Bracket centres are a layout choice, not necessarily a crossing bond's
+    # midpoint. An asymmetric bracket extent makes a tangential shift obvious.
+    root = ET.fromstring((DATA / "mixed_rings_periodic.cdxml").read_bytes())
+    for graphic in root.iter("graphic"):
+        if graphic.get("BracketType") == "Square":
+            values = list(map(float, graphic.get("BoundingBox").split()))
+            values[1] -= 45
+            values[3] -= 45
+            graphic.set("BoundingBox", " ".join(map(str, values)))
+    widget = CdxmlUploadWidget()
+    upload(widget, ET.tostring(root))
+    original = drawing_positions(widget._selected_cdxml_content())
+    original = np.column_stack([original, np.zeros(len(original))])
+    widget.symmetrize_geometry.value = True
+    updated = drawing_positions(widget._preview_cdxml)
+    updated = np.column_stack([updated, np.zeros(len(updated))])
+    cleaned_root = ET.fromstring(widget._preview_cdxml)
+    cleaned_graphics = {
+        graphic.get("id"): graphic for graphic in cleaned_root.iter("graphic")
+    }
+    for graphic in root.iter("graphic"):
+        if graphic.get("BracketType") != "Square":
+            continue
+        corners = np.asarray(
+            list(map(float, graphic.get("BoundingBox").split()))
+        ).reshape((2, 2))
+        corners = np.column_stack([corners, np.zeros(2)])
+        expected = np.asarray(widget.transform_points(original, updated, corners))
+        actual = np.asarray(
+            list(
+                map(
+                    float,
+                    cleaned_graphics[graphic.get("id")].get("BoundingBox").split(),
+                )
+            )
+        ).reshape((2, 2))
+        actual = np.column_stack([actual, np.zeros(2)])
+        tangent = expected[1] - expected[0]
+        tangent /= np.linalg.norm(tangent)
+        # Both ends retain their place along the stem: no artificial downward
+        # displacement, elongation, or shortening after cleanup.
+        assert np.allclose((actual - expected) @ tangent, 0, atol=1e-6)
+        assert np.linalg.norm(actual[1] - actual[0]) == pytest.approx(
+            np.linalg.norm(expected[1] - expected[0]), abs=1e-6
+        )
+        assert np.isfinite(actual).all()
