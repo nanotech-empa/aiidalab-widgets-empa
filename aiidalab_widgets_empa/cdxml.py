@@ -248,11 +248,65 @@ class CdxmlUploadWidget(ipw.VBox):
             layout={"width": "initial"},
         )
         self.preview_zoom.on_click(self._toggle_preview_size)
+        self.bracket_shifts = {
+            side: ipw.FloatText(
+                value=0.0,
+                description=f"{side.capitalize()} (Å)",
+                step=0.1,
+                layout={"width": "170px"},
+                style={"description_width": "initial"},
+            )
+            for side in ("left", "right")
+        }
+        self.bracket_shift_step = ipw.BoundedFloatText(
+            value=0.1,
+            min=0.001,
+            max=10.0,
+            step=0.1,
+            description="Step (Å)",
+            layout={"width": "165px"},
+            style={"description_width": "initial"},
+        )
+        self.bracket_shift_buttons = {}
+        self.bracket_shift_resets = {}
+        self._updating_bracket_shift = False
+        rows = [ipw.HTML("<b>Bracket drawing shifts</b>"), self.bracket_shift_step]
+        for side, offset in self.bracket_shifts.items():
+            offset.observe(self._on_bracket_shift_change, names="value")
+            buttons = []
+            for direction, icon in ((-1, "arrow-left"), (1, "arrow-right")):
+                button = ipw.Button(
+                    icon=icon,
+                    tooltip=f"Move the {side} bracket",
+                    layout={"width": "40px"},
+                )
+                button.on_click(
+                    lambda _,
+                    selected=side,
+                    sign=direction: self._shift_bracket_drawing(selected, sign)
+                )
+                self.bracket_shift_buttons[(side, direction)] = button
+                buttons.append(button)
+            reset = ipw.Button(
+                icon="undo",
+                tooltip=f"Reset the {side} bracket drawing shift",
+                layout={"width": "40px"},
+            )
+            reset.on_click(
+                lambda _, selected=side: setattr(
+                    self.bracket_shifts[selected], "value", 0.0
+                )
+            )
+            self.bracket_shift_resets[side] = reset
+            rows.append(ipw.HBox([offset, *buttons, reset]))
+        self.bracket_shift_step.observe(self._on_bracket_step_change, names="value")
+        self.bracket_controls = ipw.VBox(rows, layout={"display": "none"})
         self.preview_box = ipw.VBox(
             [
                 ipw.HTML("<b>Selected chemical sketch</b>"),
                 self.png_preview,
                 self.preview_zoom,
+                self.bracket_controls,
                 self.preview_message,
             ],
             layout={"display": "none"},
@@ -519,14 +573,20 @@ class CdxmlUploadWidget(ipw.VBox):
             structure_index = 0
         return self._select_cdxml_structure(self._cdxml_content, structure_index)
 
-    def _update_png_preview(self) -> None:
+    def _update_png_preview(self, *, reset_zoom: bool = True) -> None:
         """Show the original selected drawing before creating an atomistic model."""
         set_png_widget(self.png_preview, b"")
         self.preview_message.value = ""
+        self.bracket_controls.layout.display = "none"
         self.preview_zoom.disabled = True
-        self._preview_expanded = False
-        self.preview_zoom.description = "Enlarge preview"
-        self.preview_zoom.icon = "search-plus"
+        if reset_zoom:
+            self._preview_expanded = False
+        self.preview_zoom.description = (
+            "Reduce preview" if self._preview_expanded else "Enlarge preview"
+        )
+        self.preview_zoom.icon = (
+            "search-minus" if self._preview_expanded else "search-plus"
+        )
         self.preview_box.layout.display = "flex"
         try:
             content = self._selected_cdxml_content()
@@ -535,10 +595,19 @@ class CdxmlUploadWidget(ipw.VBox):
                 and self._conversion_signature is not None
             ):
                 content = self._cleaned_drawing(content)
+                if any(
+                    graphic.get("BracketType") == "Square"
+                    for graphic in ET.fromstring(content).iter("graphic")
+                ):
+                    self.bracket_controls.layout.display = "flex"
             self._preview_cdxml = (
                 content.encode("utf-8") if isinstance(content, str) else content
             )
-            set_png_widget(self.png_preview, render_cdxml_png(self._preview_cdxml))
+            set_png_widget(
+                self.png_preview,
+                render_cdxml_png(self._preview_cdxml),
+                max_side=900 if self._preview_expanded else 300,
+            )
             self.preview_zoom.disabled = False
         except Exception as exc:  # noqa: BLE001
             self.preview_message.value = (
@@ -601,19 +670,96 @@ class CdxmlUploadWidget(ipw.VBox):
                         displacement - np.dot(displacement, tangent) * tangent
                     )
                     transformed[graphic_index] += perpendicular
-            for graphic, pair in zip(bracket_graphics, transformed):
+            atom_indices = {node.get("id"): index for index, node in enumerate(nodes)}
+            bond_lengths = []
+            carbon_bond_lengths = []
+            for bond in root.iter("b"):
+                first_index = atom_indices.get(bond.get("B"))
+                second_index = atom_indices.get(bond.get("E"))
+                if first_index is None or second_index is None:
+                    continue
+                length = np.linalg.norm(updated[second_index] - updated[first_index])
+                if length <= 1.0e-12:
+                    continue
+                bond_lengths.append(length)
+                if (
+                    self.atoms[first_index].symbol
+                    == self.atoms[second_index].symbol
+                    == "C"
+                ):
+                    carbon_bond_lengths.append(length)
+            padding = (
+                float(np.median(carbon_bond_lengths or bond_lengths))
+                if bond_lengths
+                else 0.0
+            )
+            physical_size = np.linalg.norm(
+                self.atoms.positions - self.atoms.positions.mean(axis=0), axis=1
+            ).mean()
+            drawing_size = np.linalg.norm(updated - updated.mean(axis=0), axis=1).mean()
+            drawing_scale = (
+                drawing_size / physical_size if physical_size > 1.0e-12 else 0.0
+            )
+            left_to_right = sorted(
+                range(len(transformed)),
+                key=lambda index: tuple(transformed[index].mean(axis=0)[:2]),
+            )
+            sides = {
+                index: "left" if rank == 0 else "right"
+                for rank, index in enumerate(left_to_right)
+            }
+            for index, (graphic, pair) in enumerate(zip(bracket_graphics, transformed)):
+                stem = pair[1] - pair[0]
+                stem_length = np.linalg.norm(stem)
+                if stem_length > 1.0e-12:
+                    tangent = stem / stem_length
+                    projections = updated @ tangent
+                    pair[0] += (
+                        projections.min() - padding - np.dot(pair[0], tangent)
+                    ) * tangent
+                    pair[1] += (
+                        projections.max() + padding - np.dot(pair[1], tangent)
+                    ) * tangent
+                    normal = normalize(np.array([tangent[1], -tangent[0], 0.0]))
+                    if normal[0] < 0 or (abs(normal[0]) < 1.0e-12 and normal[1] < 0):
+                        normal *= -1
+                    pair += (
+                        normal * self.bracket_shifts[sides[index]].value * drawing_scale
+                    )
                 graphic.set(
                     "BoundingBox",
                     " ".join(f"{value:.9g}" for value in pair[:, :2].ravel()),
                 )
         return ET.tostring(root, encoding="utf-8")
 
+    def _reset_bracket_drawing_shift(self) -> None:
+        self._updating_bracket_shift = True
+        try:
+            for offset in self.bracket_shifts.values():
+                offset.value = 0.0
+        finally:
+            self._updating_bracket_shift = False
+
+    def _on_bracket_shift_change(self, _=None) -> None:
+        if not self._updating_bracket_shift and self._cdxml_content is not None:
+            self._update_png_preview(reset_zoom=False)
+
+    def _on_bracket_step_change(self, _=None) -> None:
+        for offset in self.bracket_shifts.values():
+            offset.step = self.bracket_shift_step.value
+
+    def _shift_bracket_drawing(self, side: str, direction: int) -> None:
+        offset = self.bracket_shifts[side]
+        offset.value = round(
+            offset.value + direction * self.bracket_shift_step.value, 12
+        )
+
     def _on_geometry_option_change(self, _=None) -> None:
         if self._cdxml_content is None:
             return
         self.structure = None
         self._convert_uploaded_cdxml()
-        self._update_png_preview()
+        self._update_png_preview(reset_zoom=False)
 
     def _toggle_preview_size(self, _=None) -> None:
         self._preview_expanded = not self._preview_expanded
@@ -635,6 +781,7 @@ class CdxmlUploadWidget(ipw.VBox):
             return
         if change is not None and change.get("new") is None:
             return
+        self._reset_bracket_drawing_shift()
         self.structure = None
         self.nunits.value = "Infinite"
         self.nunits.disabled = True
@@ -710,6 +857,7 @@ class CdxmlUploadWidget(ipw.VBox):
 
         _, self._cdxml_content = get_unified_representation(upload_value)[0]
         self._conversion_signature = None
+        self._reset_bracket_drawing_shift()
         self.structure = None
         try:
             self._configure_structure_selector()

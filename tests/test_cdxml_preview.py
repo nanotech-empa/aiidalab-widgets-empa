@@ -168,9 +168,8 @@ def test_automatic_ring_double_lines_point_inward():
     assert np.array(image)[:, :, :3].min() < 50
 
 
-def test_cleanup_moves_brackets_only_perpendicular_to_their_stems():
-    # Bracket centres are a layout choice, not necessarily a crossing bond's
-    # midpoint. An asymmetric bracket extent makes a tangential shift obvious.
+def test_cleanup_brackets_have_one_bond_padding_and_follow_the_same_cut_lines():
+    # Bracket extent is a graphical choice, not a crossing bond midpoint.
     root = ET.fromstring((DATA / "mixed_rings_periodic.cdxml").read_bytes())
     for graphic in root.iter("graphic"):
         if graphic.get("BracketType") == "Square":
@@ -185,6 +184,17 @@ def test_cleanup_moves_brackets_only_perpendicular_to_their_stems():
     widget.symmetrize_geometry.value = True
     updated = drawing_positions(widget._preview_cdxml)
     updated = np.column_stack([updated, np.zeros(len(updated))])
+    indices = {node.get("id"): index for index, node in enumerate(root.iter("n"))}
+    lengths = [
+        np.linalg.norm(
+            updated[indices[bond.get("B")]] - updated[indices[bond.get("E")]]
+        )
+        for bond in root.iter("b")
+    ]
+    padding = np.median(lengths)
+    boundaries = np.asarray(
+        widget.transform_points(widget.atoms.positions, updated, widget.crossing_points)
+    )
     cleaned_root = ET.fromstring(widget._preview_cdxml)
     cleaned_graphics = {
         graphic.get("id"): graphic for graphic in cleaned_root.iter("graphic")
@@ -208,10 +218,114 @@ def test_cleanup_moves_brackets_only_perpendicular_to_their_stems():
         actual = np.column_stack([actual, np.zeros(2)])
         tangent = expected[1] - expected[0]
         tangent /= np.linalg.norm(tangent)
-        # Both ends retain their place along the stem: no artificial downward
-        # displacement, elongation, or shortening after cleanup.
-        assert np.allclose((actual - expected) @ tangent, 0, atol=1e-6)
-        assert np.linalg.norm(actual[1] - actual[0]) == pytest.approx(
-            np.linalg.norm(expected[1] - expected[0]), abs=1e-6
+        projections = updated @ tangent
+        assert actual[0] @ tangent == pytest.approx(
+            projections.min() - padding, abs=1e-6
+        )
+        assert actual[1] @ tangent == pytest.approx(
+            projections.max() + padding, abs=1e-6
+        )
+        normal = np.array([-tangent[1], tangent[0], 0.0])
+        assert (
+            min(
+                abs((actual.mean(axis=0) - boundary) @ normal)
+                for boundary in boundaries
+            )
+            < 1e-6
         )
         assert np.isfinite(actual).all()
+
+
+@pytest.mark.parametrize("drawing_scale", [1.0, 5.0])
+def test_independent_bracket_shifts_use_angstroms_and_preserve_the_model(drawing_scale):
+    root = ET.fromstring((DATA / "mixed_rings_periodic.cdxml").read_bytes())
+    for node in root.iter("n"):
+        node.set(
+            "p",
+            " ".join(
+                str(float(value) * drawing_scale) for value in node.get("p").split()
+            ),
+        )
+    for graphic in root.iter("graphic"):
+        if graphic.get("BracketType") == "Square":
+            graphic.set(
+                "BoundingBox",
+                " ".join(
+                    str(float(value) * drawing_scale)
+                    for value in graphic.get("BoundingBox").split()
+                ),
+            )
+    widget = CdxmlUploadWidget()
+    upload(widget, ET.tostring(root))
+    original_png = bytes(widget.png_preview.value)
+    widget.symmetrize_geometry.value = True
+    assert widget.bracket_controls.layout.display == "flex"
+    baseline_png = bytes(widget.png_preview.value)
+    widget.create_button.click()
+    baseline = widget.structure.copy()
+    boundaries = widget.crossing_points.copy()
+    assert baseline.cell[0, 0] == pytest.approx(
+        np.linalg.norm(boundaries[1] - boundaries[0])
+    )
+
+    def boxes():
+        graphics = [
+            graphic
+            for graphic in ET.fromstring(widget._preview_cdxml).iter("graphic")
+            if graphic.get("BracketType") == "Square"
+        ]
+        result = {
+            graphic.get("id"): np.asarray(
+                list(map(float, graphic.get("BoundingBox").split()))
+            ).reshape((2, 2))
+            for graphic in graphics
+        }
+        sides = sorted(
+            result, key=lambda identifier: tuple(result[identifier].mean(axis=0))
+        )
+        return result, sides
+
+    before, sides = boxes()
+    physical = widget.atoms.positions[:, :2]
+    drawn = drawing_positions(widget._preview_cdxml)
+    unit_scale = (
+        np.linalg.norm(drawn - drawn.mean(axis=0), axis=1).mean()
+        / np.linalg.norm(physical - physical.mean(axis=0), axis=1).mean()
+    )
+    assert widget.bracket_shift_step.value == 0.1
+    widget.preview_zoom.click()
+    assert widget._preview_expanded
+    widget.bracket_shift_buttons[("left", 1)].click()
+    assert widget._preview_expanded
+    after, _ = boxes()
+    assert widget.bracket_shifts["left"].value == 0.1
+    assert widget.bracket_shifts["right"].value == 0.0
+    assert np.allclose(after[sides[1]], before[sides[1]])
+    assert np.allclose(
+        after[sides[0]] - before[sides[0]], [0.1 * unit_scale, 0.0], atol=1e-6
+    )
+    widget.bracket_shift_step.value = 0.05
+    widget.bracket_shift_buttons[("right", -1)].click()
+    after, _ = boxes()
+    assert widget.bracket_shifts["right"].value == -0.05
+    assert all(offset.step == 0.05 for offset in widget.bracket_shifts.values())
+    assert np.allclose(
+        after[sides[1]] - before[sides[1]], [-0.05 * unit_scale, 0.0], atol=1e-6
+    )
+    assert np.array_equal(widget.crossing_points, boundaries)
+    widget.create_button.click()
+    assert np.array_equal(widget.structure.positions, baseline.positions)
+    assert np.array_equal(widget.structure.cell, baseline.cell)
+    assert np.array_equal(widget.structure.pbc, baseline.pbc)
+    widget.symmetrize_geometry.value = False
+    assert bytes(widget.png_preview.value) == original_png
+    assert widget.bracket_controls.layout.display == "none"
+    widget.symmetrize_geometry.value = True
+    widget.bracket_shift_resets["left"].click()
+    assert widget.bracket_shifts["left"].value == 0
+    assert widget.bracket_shifts["right"].value == -0.05
+    widget.bracket_shift_resets["right"].click()
+    assert bytes(widget.png_preview.value) == baseline_png
+    widget.bracket_shifts["left"].value = 0.2
+    upload(widget, ET.tostring(root))
+    assert all(offset.value == 0 for offset in widget.bracket_shifts.values())
