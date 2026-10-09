@@ -16,6 +16,7 @@ from ase.neighborlist import NeighborList
 from scipy.optimize import least_squares, linear_sum_assignment
 
 from .cdxml_rendering import render_cdxml_png, set_png_widget
+from .cdxml_sterics import relieve_steric_contacts
 
 
 # ---------------- Utility functions ----------------
@@ -324,6 +325,24 @@ class CdxmlUploadWidget(ipw.VBox):
             indent=False,
         )
         self.symmetrize_geometry.observe(self._on_geometry_option_change, names="value")
+        self.resolve_steric_collisions = ipw.Checkbox(
+            description="Resolve steric contacts in 3D",
+            value=False,
+            disabled=True,
+            indent=False,
+        )
+        self.resolve_steric_collisions.observe(
+            self._on_steric_option_change, names="value"
+        )
+        self.use_clever_hydrogenation.observe(
+            self._on_hydrogenation_option_change, names="value"
+        )
+        self.steric_help = ipw.HTML(
+            "Finite C/H/halogen molecules: rotate connected aromatic blocks and "
+            "methyl hydrogens. The sketch stays 2D; Create model produces a 3D "
+            "starting conformer, without energy optimization.",
+            layout={"display": "none"},
+        )
         self.create_button = ipw.Button(
             description="Create model", button_style="success"
         )
@@ -347,6 +366,8 @@ class CdxmlUploadWidget(ipw.VBox):
                 self.nunits,
                 self.use_clever_hydrogenation,
                 self.symmetrize_geometry,
+                self.resolve_steric_collisions,
+                self.steric_help,
                 supported_formats,
                 self.create_button,
                 self.output_message,
@@ -761,6 +782,23 @@ class CdxmlUploadWidget(ipw.VBox):
         self._convert_uploaded_cdxml()
         self._update_png_preview(reset_zoom=False)
 
+    def _update_steric_option(self) -> None:
+        self.resolve_steric_collisions.disabled = (
+            self._conversion_signature is None
+            or not self.nunits.disabled
+            or not self.use_clever_hydrogenation.value
+        )
+        self.steric_help.layout.display = (
+            "none" if self.resolve_steric_collisions.disabled else ""
+        )
+
+    def _on_steric_option_change(self, _=None) -> None:
+        self.structure = None
+
+    def _on_hydrogenation_option_change(self, _=None) -> None:
+        self.structure = None
+        self._update_steric_option()
+
     def _toggle_preview_size(self, _=None) -> None:
         self._preview_expanded = not self._preview_expanded
         set_png_widget(
@@ -816,6 +854,7 @@ class CdxmlUploadWidget(ipw.VBox):
             )
             self.nunits.disabled = bool(is_not_periodic)
             self._conversion_signature = signature
+            self._update_steric_option()
             self.output_message.value = (
                 f"Ready to create the structure. {self._geometry_message}"
             )
@@ -826,6 +865,7 @@ class CdxmlUploadWidget(ipw.VBox):
         # widget instead of interrupting the notebook event loop.
         except Exception as exc:  # noqa: BLE001
             self.output_message.value = f"Unexpected error: {html.escape(str(exc))}"
+        self._update_steric_option()
         return False
 
     def _on_file_upload(self, change=None) -> None:
@@ -882,8 +922,36 @@ class CdxmlUploadWidget(ipw.VBox):
             return
 
         atoms = self.atoms.copy()
+        source_atoms = (
+            self.whole_atoms if self.use_clever_hydrogenation.value else self.atoms
+        )
+        if source_atoms is None:
+            self.output_message.value = "Error: Converted atoms are unavailable."
+            return
+        steric_message = ""
 
-        if self.crossing_points is not None:
+        if self.nunits.disabled:
+            # A finite molecule has no periodic cut. Keep every explicit and
+            # bond-order-derived H, even when its initial drawing is crowded.
+            atoms = source_atoms.copy()
+            bonds = atoms.info.pop("_cdxml_bonds", [])
+            stereochemistry = atoms.info.pop("_cdxml_stereochemistry", False)
+            if bonds:
+                resolve = (
+                    self.resolve_steric_collisions.value
+                    and self.use_clever_hydrogenation.value
+                )
+                if resolve and stereochemistry:
+                    steric_message = (
+                        "3D relief skipped: the drawing encodes stereochemistry; "
+                        "all atoms retained. Inspect the model."
+                    )
+                else:
+                    result = relieve_steric_contacts(atoms, bonds, resolve=resolve)
+                    atoms = result.atoms
+                    if resolve or result.initial_contacts:
+                        steric_message = result.message
+        elif self.crossing_points is not None:
             if self.cdxml_atoms is None:
                 self.output_message.value = (
                     "Error: CDXML atom positions are unavailable."
@@ -892,12 +960,6 @@ class CdxmlUploadWidget(ipw.VBox):
             crossing_points = self.transform_points(
                 self.cdxml_atoms, atoms.positions, self.crossing_points
             )
-            source_atoms = (
-                self.whole_atoms if self.use_clever_hydrogenation.value else self.atoms
-            )
-            if source_atoms is None:
-                self.output_message.value = "Error: Converted atoms are unavailable."
-                return
             atoms = self.align_and_trim_atoms(
                 source_atoms,
                 np.array(crossing_points),
@@ -918,11 +980,15 @@ class CdxmlUploadWidget(ipw.VBox):
             atoms.pbc = [True, False, False]
 
         messages = ["Structure created.", self._geometry_message]
+        if steric_message:
+            messages.append(html.escape(steric_message))
         if not self.use_clever_hydrogenation.value:
             hydrogen_message, atoms = self.add_safe_hydrogen_atoms(atoms)
             messages.append(hydrogen_message)
         self.output_message.value = " ".join(messages)
 
+        atoms.info.pop("_cdxml_bonds", None)
+        atoms.info.pop("_cdxml_stereochemistry", None)
         self.structure = atoms
 
     @staticmethod
@@ -1262,6 +1328,10 @@ class CdxmlUploadWidget(ipw.VBox):
 
         # --- Add hydrogens ---
         pos, sym = list(bare_pos), list(bare_sym)
+        atom_index = {aid: index for index, aid in enumerate(atoms)}
+        chemical_bonds = [
+            (atom_index[b["a1"]], atom_index[b["a2"]], b["order"]) for b in bonds
+        ]
         for aid, nH in impl_H.items():
             if nH == 0:
                 continue
@@ -1272,9 +1342,13 @@ class CdxmlUploadWidget(ipw.VBox):
             orders = [o for _, o in conn[aid]]
 
             def add_H(
-                vecs: list[np.ndarray], length: float = 1.09, center: np.ndarray = c
+                vecs: list[np.ndarray],
+                length: float = 1.09,
+                center: np.ndarray = c,
+                parent: int = atom_index[aid],
             ):
                 for v in vecs:
+                    chemical_bonds.append((parent, len(pos), 1.0))
                     pos.append(center + length * v)
                     sym.append("H")
 
@@ -1407,6 +1481,16 @@ class CdxmlUploadWidget(ipw.VBox):
                 add_H([avg], 1.09)
 
         mol = Atoms(symbols=sym, positions=pos)
+        # Transient conversion metadata, consumed before storing/exporting the
+        # finite model. Close geometric contacts never enter this bond list.
+        mol.info["_cdxml_bonds"] = chemical_bonds
+        mol.info["_cdxml_stereochemistry"] = any(
+            "wedge" in b.get("Display", "").lower()
+            or "hash" in b.get("Display", "").lower()
+            or "wavy" in b.get("Display", "").lower()
+            or b.get("BS", "U") not in {"", "N", "U"}
+            for b in root.iter("b")
+        ) or any(n.get("AS", "U") not in {"", "N", "U"} for n in root.iter("n"))
         msg = geometry_message
         return msg, bare_mol, mol
 
