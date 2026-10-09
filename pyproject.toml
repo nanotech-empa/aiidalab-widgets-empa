@@ -24,7 +24,9 @@ readme = "README.md"
 dependencies = [
     "aiida-core>=2.6.0,<3",
     "ase>=3.24",
+    "matplotlib",  # shared CDXML drawing renderer; already required by ASE
     "ipywidgets>=7.6.0",
+    "scipy>=1.10",
     "timelength>=3.0.0,<4.0.0",  # not a super-established package, but seems to be the best option for parsing the human-readable time strings
 ]
 

@@ -1,5 +1,9 @@
-"""Widget to convert CDXML to planar structures"""
+"""Import molecular and periodic structures from ChemDraw CDXML files."""
 
+from __future__ import annotations
+
+import html
+import math
 import xml.etree.ElementTree as ET
 
 import ase
@@ -7,20 +11,217 @@ import ipywidgets as ipw
 import numpy as np
 import traitlets as tr
 from ase import Atoms
-from ase.data import chemical_symbols, covalent_radii
+from ase.data import covalent_radii
 from ase.neighborlist import NeighborList
-from scipy.spatial.distance import pdist
+from scipy.optimize import least_squares, linear_sum_assignment
+
+from .cdxml_rendering import render_cdxml_png, set_png_widget
 
 
+# ---------------- Utility functions ----------------
+def normalize(v: np.ndarray) -> np.ndarray:
+    """Return the normalized version of vector v, or zeros if near-zero norm."""
+    v = np.array(v, float)
+    n = np.linalg.norm(v)
+    return v / n if n > 1e-12 else np.zeros(3)
+
+
+def rotation_matrix_from_vectors(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Return the rotation matrix that rotates vector a into vector b."""
+    a, b = normalize(a), normalize(b)
+    v = np.cross(a, b)
+    c = np.dot(a, b)
+    if np.linalg.norm(v) < 1e-8:
+        return np.eye(3)
+    vx = np.array(
+        [
+            [0, -v[2], v[1]],
+            [v[2], 0, -v[0]],
+            [-v[1], v[0], 0],
+        ]
+    )
+    return np.eye(3) + vx + vx @ vx * ((1 - c) / (np.linalg.norm(v) ** 2))
+
+
+def rotate_vector(v: np.ndarray, axis: np.ndarray, angle: float) -> np.ndarray:
+    """Rotate vector v around given axis by 'angle' radians."""
+    axis = normalize(axis)
+    v = np.array(v)
+    return (
+        v * math.cos(angle)
+        + np.cross(axis, v) * math.sin(angle)
+        + axis * np.dot(axis, v) * (1 - math.cos(angle))
+    )
+
+
+def _signed_area(points: np.ndarray) -> float:
+    """Return the signed area of a two-dimensional polygon."""
+    x, y = points[:, 0], points[:, 1]
+    return 0.5 * float(np.sum(x * np.roll(y, -1) - y * np.roll(x, -1)))
+
+
+def _bounded_faces(
+    positions: np.ndarray, edges: list[tuple[int, int]]
+) -> list[list[int]]:
+    """Find bounded faces in an existing straight-line planar embedding."""
+    adjacency = {index: [] for index in range(len(positions))}
+    for first, second in edges:
+        adjacency[first].append(second)
+        adjacency[second].append(first)
+
+    ordered = {}
+    for center, neighbors in adjacency.items():
+        ordered[center] = sorted(
+            neighbors,
+            key=lambda neighbor: math.atan2(
+                positions[neighbor, 1] - positions[center, 1],
+                positions[neighbor, 0] - positions[center, 0],
+            ),
+        )
+
+    visited = set()
+    faces = []
+    for first, second in edges:
+        for start in ((first, second), (second, first)):
+            if start in visited:
+                continue
+            face = []
+            current = start
+            while current not in visited:
+                visited.add(current)
+                left, right = current
+                face.append(left)
+                neighbors = ordered[right]
+                if not neighbors:
+                    break
+                incoming = neighbors.index(left)
+                current = (right, neighbors[(incoming - 1) % len(neighbors)])
+                if current == start:
+                    break
+            if current == start and len(face) >= 3 and len(set(face)) == len(face):
+                faces.append(face)
+
+    if not faces:
+        return []
+    areas = [abs(_signed_area(positions[face])) for face in faces]
+    exterior = int(np.argmax(areas))
+    return [
+        face
+        for index, face in enumerate(faces)
+        if index != exterior and 3 <= len(face) <= 12
+    ]
+
+
+def _segments_properly_cross(
+    first: np.ndarray,
+    second: np.ndarray,
+    third: np.ndarray,
+    fourth: np.ndarray,
+    tolerance: float = 1.0e-10,
+) -> bool:
+    """Return whether two line segments cross away from their endpoints."""
+
+    def orientation(a, b, c):
+        first = b - a
+        second = c - a
+        return float(first[0] * second[1] - first[1] * second[0])
+
+    def lies_on_segment(start, end, point):
+        if abs(orientation(start, end, point)) > tolerance:
+            return False
+        return bool(
+            np.all(point >= np.minimum(start, end) - tolerance)
+            and np.all(point <= np.maximum(start, end) + tolerance)
+        )
+
+    o1 = orientation(first, second, third)
+    o2 = orientation(first, second, fourth)
+    o3 = orientation(third, fourth, first)
+    o4 = orientation(third, fourth, second)
+    if o1 * o2 < -tolerance and o3 * o4 < -tolerance:
+        return True
+    return any(
+        (
+            lies_on_segment(first, second, third),
+            lies_on_segment(first, second, fourth),
+            lies_on_segment(third, fourth, first),
+            lies_on_segment(third, fourth, second),
+        )
+    )
+
+
+def _has_bond_crossings(positions: np.ndarray, edges: list[tuple[int, int]]) -> bool:
+    """Check a straight-line graph embedding for non-adjacent bond crossings."""
+    for edge_index, (first, second) in enumerate(edges):
+        for third, fourth in edges[edge_index + 1 :]:
+            if len({first, second, third, fourth}) < 4:
+                continue
+            if _segments_properly_cross(
+                positions[first], positions[second], positions[third], positions[fourth]
+            ):
+                return True
+    return False
+
+
+def _top_level_cdxml_fragments(root: ET.Element) -> list[ET.Element]:
+    """Return chemical fragments that are not nested in another fragment."""
+    parents = {child: parent for parent in root.iter() for child in parent}
+    fragments = []
+    for fragment in root.iter("fragment"):
+        parent = parents.get(fragment)
+        while parent is not None and parent.tag != "fragment":
+            parent = parents.get(parent)
+        if parent is not None:
+            continue
+        if any(node.get("p") for node in fragment.iter("n")):
+            fragments.append(fragment)
+    return fragments
+
+
+def _element_bounding_box(
+    element: ET.Element,
+) -> tuple[float, float, float, float] | None:
+    """Return an element bounding box, falling back to its point position."""
+    if bounding_box := element.get("BoundingBox"):
+        coordinates = [float(value) for value in bounding_box.split()]
+        if len(coordinates) == 4:
+            first_x, first_y, second_x, second_y = coordinates
+            return (
+                min(first_x, second_x),
+                min(first_y, second_y),
+                max(first_x, second_x),
+                max(first_y, second_y),
+            )
+    if position := element.get("p"):
+        coordinates = [float(value) for value in position.split()]
+        if len(coordinates) >= 2:
+            return (coordinates[0], coordinates[1], coordinates[0], coordinates[1])
+    return None
+
+
+def _rectangle_distance(
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
+) -> float:
+    """Return the shortest distance between two axis-aligned rectangles."""
+    first_min_x, first_min_y, first_max_x, first_max_y = first
+    second_min_x, second_min_y, second_max_x, second_max_y = second
+    delta_x = max(first_min_x - second_max_x, second_min_x - first_max_x, 0.0)
+    delta_y = max(first_min_y - second_max_y, second_min_y - first_max_y, 0.0)
+    return math.hypot(delta_x, delta_y)
+
+
+# ---------------- Main Widget ----------------
 class CdxmlUploadWidget(ipw.VBox):
-    """Widget for uploading CDXML files and converting them to ASE Atoms structures."""
+    """Widget for uploading CDXML files and converting them into ASE.Atoms structures."""
 
     structure = tr.Instance(ase.Atoms, allow_none=True)
+    _maximum_label_distance_in_bonds = 2.5
 
-    def __init__(self, title="CDXML to GNR", description="Upload Structure"):
+    def __init__(self, title: str = "CDXML", description: str = "Upload CDXML"):
         self.title = title
 
-        # File upload widget for .cdxml files
+        # --- File upload widget ---
         self.file_upload = ipw.FileUpload(
             description=description,
             multiple=False,
@@ -29,11 +230,102 @@ class CdxmlUploadWidget(ipw.VBox):
         )
         self.file_upload.observe(self._on_file_upload, names="value")
 
-        # Additional widgets
+        # --- Additional widgets ---
+        self.structure_selector = ipw.Dropdown(
+            description="Structure",
+            options=(),
+            disabled=True,
+            layout={"display": "none", "width": "initial"},
+            style={"description_width": "initial"},
+        )
+        self.structure_selector.observe(self._on_structure_selection, names="value")
+        self.png_preview = ipw.Image(format="png")
+        self.preview_message = ipw.HTML()
+        self.preview_zoom = ipw.Button(
+            description="Enlarge preview",
+            icon="search-plus",
+            disabled=True,
+            layout={"width": "initial"},
+        )
+        self.preview_zoom.on_click(self._toggle_preview_size)
+        self.bracket_shifts = {
+            side: ipw.FloatText(
+                value=0.0,
+                description=f"{side.capitalize()} (Å)",
+                step=0.1,
+                layout={"width": "170px"},
+                style={"description_width": "initial"},
+            )
+            for side in ("left", "right")
+        }
+        self.bracket_shift_step = ipw.BoundedFloatText(
+            value=0.1,
+            min=0.001,
+            max=10.0,
+            step=0.1,
+            description="Step (Å)",
+            layout={"width": "165px"},
+            style={"description_width": "initial"},
+        )
+        self.bracket_shift_buttons = {}
+        self.bracket_shift_resets = {}
+        self._updating_bracket_shift = False
+        rows = [ipw.HTML("<b>Bracket drawing shifts</b>"), self.bracket_shift_step]
+        for side, offset in self.bracket_shifts.items():
+            offset.observe(self._on_bracket_shift_change, names="value")
+            buttons = []
+            for direction, icon in ((-1, "arrow-left"), (1, "arrow-right")):
+                button = ipw.Button(
+                    icon=icon,
+                    tooltip=f"Move the {side} bracket",
+                    layout={"width": "40px"},
+                )
+                button.on_click(
+                    lambda _,
+                    selected=side,
+                    sign=direction: self._shift_bracket_drawing(selected, sign)
+                )
+                self.bracket_shift_buttons[(side, direction)] = button
+                buttons.append(button)
+            reset = ipw.Button(
+                icon="undo",
+                tooltip=f"Reset the {side} bracket drawing shift",
+                layout={"width": "40px"},
+            )
+            reset.on_click(
+                lambda _, selected=side: setattr(
+                    self.bracket_shifts[selected], "value", 0.0
+                )
+            )
+            self.bracket_shift_resets[side] = reset
+            rows.append(ipw.HBox([offset, *buttons, reset]))
+        self.bracket_shift_step.observe(self._on_bracket_step_change, names="value")
+        self.bracket_controls = ipw.VBox(rows, layout={"display": "none"})
+        self.preview_box = ipw.VBox(
+            [
+                ipw.HTML("<b>Selected chemical sketch</b>"),
+                self.png_preview,
+                self.preview_zoom,
+                self.bracket_controls,
+                self.preview_message,
+            ],
+            layout={"display": "none"},
+        )
+        self._preview_expanded = False
         self.nunits = ipw.Text(description="N units", value="Infinite", disabled=True)
+        self.use_clever_hydrogenation = ipw.Checkbox(
+            description="Infer implicit hydrogens from bond orders",
+            value=True,
+            indent=False,
+        )
+        self.symmetrize_geometry = ipw.Checkbox(
+            description="Clean up 2D carbon geometry",
+            value=False,
+            indent=False,
+        )
+        self.symmetrize_geometry.observe(self._on_geometry_option_change, names="value")
         self.create_button = ipw.Button(
-            description="Create model",
-            button_style="success",
+            description="Create model", button_style="success"
         )
         self.create_button.on_click(self._on_button_click)
 
@@ -44,32 +336,598 @@ class CdxmlUploadWidget(ipw.VBox):
             </a>
             """
         )
-
-        # Output message widget
         self.output_message = ipw.HTML(value="")
 
-        # Initialize the widget layout
+        # --- Layout ---
         super().__init__(
             children=[
                 self.file_upload,
+                self.structure_selector,
+                self.preview_box,
                 self.nunits,
+                self.use_clever_hydrogenation,
+                self.symmetrize_geometry,
                 supported_formats,
                 self.create_button,
                 self.output_message,
             ]
         )
 
-        # Internal state
-        self.structure = None
-        self.crossing_points = None
-        self.cdxml_atoms = None
-        self.atoms = None
+        # --- Internal state ---
+        self.structure: ase.Atoms | None = None
+        self.crossing_points: np.ndarray | None = None
+        self.cdxml_atoms: np.ndarray | None = None
+        self.atoms: ase.Atoms | None = None
+        self.whole_atoms: ase.Atoms | None = None
+        self._cdxml_content = None
+        self._conversion_signature = None
+        self._preview_cdxml = b""
+        self._geometry_message = ""
+        self._updating_structure_selector = False
+
+    # ---------------- Event handlers ----------------
+    @classmethod
+    def _cdxml_structure_options(
+        cls, cdxml_content: str | bytes
+    ) -> list[tuple[str, int]]:
+        """Find top-level structures and associate nearby captions one-to-one."""
+        root = ET.fromstring(cdxml_content)
+        fragments = _top_level_cdxml_fragments(root)
+        if not fragments:
+            if any(node.get("p") for node in root.iter("n")):
+                return [("Structure 1", 0)]
+            return []
+
+        parents = {child: parent for parent in root.iter() for child in parent}
+        captions = []
+        for text_element in root.iter("t"):
+            parent = parents.get(text_element)
+            is_chemical_label = False
+            while parent is not None:
+                if parent.tag in {"fragment", "n"}:
+                    is_chemical_label = True
+                    break
+                parent = parents.get(parent)
+            if is_chemical_label:
+                continue
+            text = "".join(text_element.itertext()).strip()
+            bounding_box = _element_bounding_box(text_element)
+            if text and bounding_box is not None:
+                captions.append((text, bounding_box))
+
+        root_bond_length = None
+        try:
+            root_bond_length = float(root.get("BondLength", ""))
+        except ValueError:
+            pass
+
+        fragment_boxes = []
+        fragment_scales: list[float | None] = []
+        for fragment in fragments:
+            atom_positions = {
+                node.get("id"): np.asarray(
+                    [float(value) for value in node.get("p", "").split()[:2]]
+                )
+                for node in fragment.iter("n")
+                if node.get("id") and len(node.get("p", "").split()) >= 2
+            }
+            points = np.asarray(list(atom_positions.values()))
+            fragment_boxes.append(
+                (
+                    float(np.min(points[:, 0])),
+                    float(np.min(points[:, 1])),
+                    float(np.max(points[:, 0])),
+                    float(np.max(points[:, 1])),
+                )
+            )
+            bond_lengths = [
+                np.linalg.norm(
+                    atom_positions[bond.get("B")] - atom_positions[bond.get("E")]
+                )
+                for bond in fragment.iter("b")
+                if bond.get("B") in atom_positions and bond.get("E") in atom_positions
+            ]
+            scale = float(np.median(bond_lengths)) if bond_lengths else None
+            fragment_scales.append(scale if scale and scale > 0.0 else None)
+
+        available_scales = [scale for scale in fragment_scales if scale is not None]
+        fallback_scale = root_bond_length
+        if not fallback_scale or fallback_scale <= 0.0:
+            fallback_scale = (
+                float(np.median(available_scales)) if available_scales else 1.0
+            )
+        resolved_fragment_scales = [
+            scale if scale is not None else fallback_scale for scale in fragment_scales
+        ]
+
+        assigned_labels: list[str | None] = [None] * len(fragments)
+        if captions:
+            normalized_distances = np.asarray(
+                [
+                    [
+                        _rectangle_distance(fragment_box, caption_box) / scale
+                        for _, caption_box in captions
+                    ]
+                    for fragment_box, scale in zip(
+                        fragment_boxes, resolved_fragment_scales
+                    )
+                ]
+            )
+            unmatched_cost = cls._maximum_label_distance_in_bonds
+            costs = np.full(
+                (len(fragments), len(captions) + len(fragments)),
+                unmatched_cost,
+            )
+            costs[:, : len(captions)] = normalized_distances
+            rows, columns = linear_sum_assignment(costs)
+            for row, column in zip(rows, columns):
+                if (
+                    column < len(captions)
+                    and normalized_distances[row, column] <= unmatched_cost
+                ):
+                    assigned_labels[row] = captions[column][0]
+
+        label_counts = {
+            label: assigned_labels.count(label)
+            for label in assigned_labels
+            if label is not None
+        }
+        options = []
+        for index, label in enumerate(assigned_labels, start=1):
+            if label is None:
+                display_label = f"Structure {index}"
+            elif label_counts[label] > 1:
+                display_label = f"{label} — Structure {index}"
+            else:
+                display_label = label
+            options.append((display_label, index - 1))
+        return options
 
     @staticmethod
-    def add_hydrogen_atoms(atoms: Atoms) -> tuple[str, Atoms]:
-        """Add missing hydrogen atoms to the Atoms object based on covalent radii."""
-        message = ""
+    def _select_cdxml_structure(
+        cdxml_content: str | bytes, structure_index: int
+    ) -> str | bytes:
+        """Return CDXML containing only the selected top-level structure."""
+        root = ET.fromstring(cdxml_content)
+        fragments = _top_level_cdxml_fragments(root)
+        if not fragments:
+            if structure_index == 0 and any(node.get("p") for node in root.iter("n")):
+                return cdxml_content
+            raise ValueError("No chemical structure was found in the CDXML file.")
+        if not 0 <= structure_index < len(fragments):
+            raise ValueError("The selected CDXML structure is unavailable.")
+        if len(fragments) == 1:
+            return cdxml_content
 
+        selected_fragment = fragments[structure_index]
+        selected_ids = {
+            element.get("id")
+            for element in selected_fragment.iter()
+            if element.get("id")
+        }
+        selected_bond_ids = {
+            bond.get("id") for bond in selected_fragment.iter("b") if bond.get("id")
+        }
+
+        parents = {child: parent for parent in root.iter() for child in parent}
+        for fragment in fragments:
+            if fragment is not selected_fragment:
+                parents[fragment].remove(fragment)
+
+        selected_graphic_ids = set()
+        parents = {child: parent for parent in root.iter() for child in parent}
+        for group in list(root.iter("bracketedgroup")):
+            object_ids = set(group.get("BracketedObjectIDs", "").split())
+            crossing_bond_ids = {
+                crossing.get("BondID") for crossing in group.iter("crossingbond")
+            }
+            if object_ids & selected_ids or crossing_bond_ids & selected_bond_ids:
+                selected_graphic_ids.update(
+                    attachment.get("GraphicID")
+                    for attachment in group.findall("./bracketattachment")
+                    if attachment.get("GraphicID")
+                )
+            else:
+                parents[group].remove(group)
+
+        parents = {child: parent for parent in root.iter() for child in parent}
+        for graphic in list(root.iter("graphic")):
+            is_unused_bracket = (
+                graphic.get("BracketType") is not None
+                and graphic.get("id") not in selected_graphic_ids
+            )
+            is_unused_electron = graphic.get("SymbolType") == "Electron" and not any(
+                representation.get("object") in selected_ids
+                for representation in graphic.iter("represent")
+            )
+            if is_unused_bracket or is_unused_electron:
+                parents[graphic].remove(graphic)
+
+        return ET.tostring(root, encoding="utf-8")
+
+    def _configure_structure_selector(self) -> None:
+        """Populate the structure selector for the uploaded document."""
+        if self._cdxml_content is None:
+            options = []
+        else:
+            options = self._cdxml_structure_options(self._cdxml_content)
+        self._updating_structure_selector = True
+        try:
+            self.structure_selector.options = options
+            self.structure_selector.value = options[0][1] if options else None
+            self.structure_selector.disabled = len(options) <= 1
+            self.structure_selector.layout.display = (
+                "flex" if len(options) > 1 else "none"
+            )
+        finally:
+            self._updating_structure_selector = False
+
+    def _selected_cdxml_content(self) -> str | bytes:
+        """Return the uploaded CDXML restricted to the current selection."""
+        if self._cdxml_content is None:
+            raise ValueError("No CDXML file has been uploaded.")
+        if not self.structure_selector.options:
+            return self._cdxml_content
+        structure_index = self.structure_selector.value
+        if structure_index is None:
+            structure_index = 0
+        return self._select_cdxml_structure(self._cdxml_content, structure_index)
+
+    def _update_png_preview(self, *, reset_zoom: bool = True) -> None:
+        """Show the original selected drawing before creating an atomistic model."""
+        set_png_widget(self.png_preview, b"")
+        self.preview_message.value = ""
+        self.bracket_controls.layout.display = "none"
+        self.preview_zoom.disabled = True
+        if reset_zoom:
+            self._preview_expanded = False
+        self.preview_zoom.description = (
+            "Reduce preview" if self._preview_expanded else "Enlarge preview"
+        )
+        self.preview_zoom.icon = (
+            "search-minus" if self._preview_expanded else "search-plus"
+        )
+        self.preview_box.layout.display = "flex"
+        try:
+            content = self._selected_cdxml_content()
+            if (
+                self.symmetrize_geometry.value
+                and self._conversion_signature is not None
+            ):
+                content = self._cleaned_drawing(content)
+                if any(
+                    graphic.get("BracketType") == "Square"
+                    for graphic in ET.fromstring(content).iter("graphic")
+                ):
+                    self.bracket_controls.layout.display = "flex"
+            self._preview_cdxml = (
+                content.encode("utf-8") if isinstance(content, str) else content
+            )
+            set_png_widget(
+                self.png_preview,
+                render_cdxml_png(self._preview_cdxml),
+                max_side=900 if self._preview_expanded else 300,
+            )
+            self.preview_zoom.disabled = False
+        except Exception as exc:  # noqa: BLE001
+            self.preview_message.value = (
+                f"Sketch preview unavailable: {html.escape(str(exc))}"
+            )
+
+    def _cleaned_drawing(self, content: str | bytes) -> bytes:
+        """Project the exact prepared geometry back into the drawing's scale."""
+        if self.atoms is None:
+            raise ValueError("No prepared geometry is available.")
+        root = ET.fromstring(content)
+        nodes = [node for node in root.iter("n") if node.get("p")]
+        original = np.array(
+            [[*map(float, node.get("p").split()), 0.0] for node in nodes]
+        )
+        updated = np.asarray(
+            self.transform_points(self.atoms.positions, original, self.atoms.positions)
+        )
+        for node, position in zip(nodes, updated):
+            node.set("p", f"{position[0]:.9g} {position[1]:.9g}")
+        bracket_graphics = []
+        corners = []
+        for graphic in root.iter("graphic"):
+            if graphic.get("BracketType") != "Square" or not graphic.get("BoundingBox"):
+                continue
+            coordinates = list(map(float, graphic.get("BoundingBox").split()))
+            if len(coordinates) == 4:
+                bracket_graphics.append(graphic)
+                corners.extend(
+                    [
+                        [coordinates[0], coordinates[1], 0.0],
+                        [coordinates[2], coordinates[3], 0.0],
+                    ]
+                )
+        if corners:
+            transformed = np.asarray(
+                self.transform_points(original, updated, np.asarray(corners))
+            ).reshape((-1, 2, 3))
+            if len(bracket_graphics) == 2 and self.crossing_points is not None:
+                boundaries = np.asarray(
+                    self.transform_points(
+                        self.atoms.positions, updated, self.crossing_points
+                    )
+                )
+                centres = transformed.mean(axis=1)
+                first, second = linear_sum_assignment(
+                    np.linalg.norm(centres[:, None, :] - boundaries[None, :, :], axis=2)
+                )
+                for graphic_index, boundary_index in zip(first, second):
+                    stem = transformed[graphic_index, 1] - transformed[graphic_index, 0]
+                    stem_length = np.linalg.norm(stem)
+                    if stem_length <= 1.0e-12:
+                        continue
+                    tangent = stem / stem_length
+                    displacement = boundaries[boundary_index] - centres[graphic_index]
+                    # A crossing bond fixes the cut line, not the bracket's
+                    # midpoint along that line. Preserve the original graphical
+                    # extent instead of centring the bracket on a chosen bond.
+                    perpendicular = (
+                        displacement - np.dot(displacement, tangent) * tangent
+                    )
+                    transformed[graphic_index] += perpendicular
+            atom_indices = {node.get("id"): index for index, node in enumerate(nodes)}
+            bond_lengths = []
+            carbon_bond_lengths = []
+            for bond in root.iter("b"):
+                first_index = atom_indices.get(bond.get("B"))
+                second_index = atom_indices.get(bond.get("E"))
+                if first_index is None or second_index is None:
+                    continue
+                length = np.linalg.norm(updated[second_index] - updated[first_index])
+                if length <= 1.0e-12:
+                    continue
+                bond_lengths.append(length)
+                if (
+                    self.atoms[first_index].symbol
+                    == self.atoms[second_index].symbol
+                    == "C"
+                ):
+                    carbon_bond_lengths.append(length)
+            padding = (
+                float(np.median(carbon_bond_lengths or bond_lengths))
+                if bond_lengths
+                else 0.0
+            )
+            physical_size = np.linalg.norm(
+                self.atoms.positions - self.atoms.positions.mean(axis=0), axis=1
+            ).mean()
+            drawing_size = np.linalg.norm(updated - updated.mean(axis=0), axis=1).mean()
+            drawing_scale = (
+                drawing_size / physical_size if physical_size > 1.0e-12 else 0.0
+            )
+            left_to_right = sorted(
+                range(len(transformed)),
+                key=lambda index: tuple(transformed[index].mean(axis=0)[:2]),
+            )
+            sides = {
+                index: "left" if rank == 0 else "right"
+                for rank, index in enumerate(left_to_right)
+            }
+            for index, (graphic, pair) in enumerate(zip(bracket_graphics, transformed)):
+                stem = pair[1] - pair[0]
+                stem_length = np.linalg.norm(stem)
+                if stem_length > 1.0e-12:
+                    tangent = stem / stem_length
+                    projections = updated @ tangent
+                    pair[0] += (
+                        projections.min() - padding - np.dot(pair[0], tangent)
+                    ) * tangent
+                    pair[1] += (
+                        projections.max() + padding - np.dot(pair[1], tangent)
+                    ) * tangent
+                    normal = normalize(np.array([tangent[1], -tangent[0], 0.0]))
+                    if normal[0] < 0 or (abs(normal[0]) < 1.0e-12 and normal[1] < 0):
+                        normal *= -1
+                    pair += (
+                        normal * self.bracket_shifts[sides[index]].value * drawing_scale
+                    )
+                graphic.set(
+                    "BoundingBox",
+                    " ".join(f"{value:.9g}" for value in pair[:, :2].ravel()),
+                )
+        return ET.tostring(root, encoding="utf-8")
+
+    def _reset_bracket_drawing_shift(self) -> None:
+        self._updating_bracket_shift = True
+        try:
+            for offset in self.bracket_shifts.values():
+                offset.value = 0.0
+        finally:
+            self._updating_bracket_shift = False
+
+    def _on_bracket_shift_change(self, _=None) -> None:
+        if not self._updating_bracket_shift and self._cdxml_content is not None:
+            self._update_png_preview(reset_zoom=False)
+
+    def _on_bracket_step_change(self, _=None) -> None:
+        for offset in self.bracket_shifts.values():
+            offset.step = self.bracket_shift_step.value
+
+    def _shift_bracket_drawing(self, side: str, direction: int) -> None:
+        offset = self.bracket_shifts[side]
+        offset.value = round(
+            offset.value + direction * self.bracket_shift_step.value, 12
+        )
+
+    def _on_geometry_option_change(self, _=None) -> None:
+        if self._cdxml_content is None:
+            return
+        self.structure = None
+        self._convert_uploaded_cdxml()
+        self._update_png_preview(reset_zoom=False)
+
+    def _toggle_preview_size(self, _=None) -> None:
+        self._preview_expanded = not self._preview_expanded
+        set_png_widget(
+            self.png_preview,
+            bytes(self.png_preview.value),
+            max_side=900 if self._preview_expanded else 300,
+        )
+        self.preview_zoom.description = (
+            "Reduce preview" if self._preview_expanded else "Enlarge preview"
+        )
+        self.preview_zoom.icon = (
+            "search-minus" if self._preview_expanded else "search-plus"
+        )
+
+    def _on_structure_selection(self, change=None) -> None:
+        """Reconvert the document when the selected structure changes."""
+        if self._updating_structure_selector or self._cdxml_content is None:
+            return
+        if change is not None and change.get("new") is None:
+            return
+        self._reset_bracket_drawing_shift()
+        self.structure = None
+        self.nunits.value = "Infinite"
+        self.nunits.disabled = True
+        self._convert_uploaded_cdxml()
+        self._update_png_preview()
+
+    def _convert_uploaded_cdxml(self) -> bool:
+        """Convert the stored CDXML with the currently selected geometry options."""
+        if self._cdxml_content is None:
+            self.output_message.value = "Error: No CDXML file has been uploaded."
+            return False
+        try:
+            selected_content = self._selected_cdxml_content()
+            signature = (selected_content, self.symmetrize_geometry.value)
+            if signature == self._conversion_signature:
+                return True
+            self._conversion_signature = None
+            self.atoms = self.whole_atoms = self.cdxml_atoms = self.crossing_points = (
+                None
+            )
+            self._geometry_message, self.atoms, self.whole_atoms = (
+                self.cdxml_to_ase_from_string(
+                    selected_content,
+                    symmetrize=self.symmetrize_geometry.value,
+                )
+            )
+            self.crossing_points, self.cdxml_atoms, is_not_periodic = (
+                self.extract_crossing_and_atom_positions(
+                    selected_content,
+                    atom_positions_override=self.atoms.positions,
+                )
+            )
+            self.nunits.disabled = bool(is_not_periodic)
+            self._conversion_signature = signature
+            self.output_message.value = (
+                f"Ready to create the structure. {self._geometry_message}"
+            )
+            return True
+        except ValueError as exc:
+            self.output_message.value = f"Error: {html.escape(str(exc))}"
+        # A file-upload callback should report unexpected malformed input in the
+        # widget instead of interrupting the notebook event loop.
+        except Exception as exc:  # noqa: BLE001
+            self.output_message.value = f"Unexpected error: {html.escape(str(exc))}"
+        return False
+
+    def _on_file_upload(self, change=None) -> None:
+        """Handle file upload and convert CDXML to ASE Atoms."""
+        upload_value = self.file_upload.value
+        if change is not None:
+            upload_value = change.get("new", upload_value)
+        if not upload_value:
+            return
+
+        self.nunits.value = "Infinite"
+        self.nunits.disabled = True
+
+        def get_unified_representation(value):
+            """Return name/content pairs for ipywidgets 7 and 8 payloads."""
+            if isinstance(value, dict):
+                return [
+                    (filename, bytes(item["content"]))
+                    for filename, item in value.items()
+                ]
+
+            files = []
+            for item in value:
+                if isinstance(item, dict):
+                    files.append((item["name"], bytes(item["content"])))
+                else:
+                    files.append((item["name"], item.content.tobytes()))
+            return files
+
+        _, self._cdxml_content = get_unified_representation(upload_value)[0]
+        self._conversion_signature = None
+        self._reset_bracket_drawing_shift()
+        self.structure = None
+        try:
+            self._configure_structure_selector()
+        except Exception:  # noqa: BLE001
+            # Conversion below reports malformed CDXML consistently in the widget.
+            self._updating_structure_selector = True
+            try:
+                self.structure_selector.options = ()
+                self.structure_selector.disabled = True
+                self.structure_selector.layout.display = "none"
+            finally:
+                self._updating_structure_selector = False
+        self._convert_uploaded_cdxml()
+        self._update_png_preview()
+
+    def _on_button_click(self, _=None) -> None:
+        """Create the ASE model when 'Create model' button is clicked."""
+        if not self._convert_uploaded_cdxml():
+            return
+        if self.atoms is None or len(self.atoms) == 0:
+            self.output_message.value = "Error: No atoms available to process."
+            return
+
+        atoms = self.atoms.copy()
+
+        if self.crossing_points is not None:
+            if self.cdxml_atoms is None:
+                self.output_message.value = (
+                    "Error: CDXML atom positions are unavailable."
+                )
+                return
+            crossing_points = self.transform_points(
+                self.cdxml_atoms, atoms.positions, self.crossing_points
+            )
+            source_atoms = (
+                self.whole_atoms if self.use_clever_hydrogenation.value else self.atoms
+            )
+            if source_atoms is None:
+                self.output_message.value = "Error: Converted atoms are unavailable."
+                return
+            atoms = self.align_and_trim_atoms(
+                source_atoms,
+                np.array(crossing_points),
+                units=self.nunits.value,
+                original_atoms=source_atoms,
+            )
+        else:
+            self.output_message.value = "Error: No periodic boundaries found."
+            return
+
+        if self.nunits.disabled:
+            extra_cell = 15.0
+            atoms.cell = np.ptp(atoms.positions, axis=0) + extra_cell
+            atoms.center()
+            atoms.pbc = False
+
+        if not self.nunits.disabled and self.nunits.value == "Infinite":
+            atoms.pbc = [True, False, False]
+
+        messages = ["Structure created.", self._geometry_message]
+        if not self.use_clever_hydrogenation.value:
+            hydrogen_message, atoms = self.add_safe_hydrogen_atoms(atoms)
+            messages.append(hydrogen_message)
+        self.output_message.value = " ".join(messages)
+
+        self.structure = atoms
+
+    @staticmethod
+    def add_safe_hydrogen_atoms(atoms: Atoms) -> tuple[str, Atoms]:
+        """Add one H to C atoms with fewer than three neighbors."""
         neighbor_list = NeighborList(
             [covalent_radii[atom.number] for atom in atoms],
             bothways=True,
@@ -80,11 +938,9 @@ class CdxmlUploadWidget(ipw.VBox):
         need_hydrogen = [
             atom.index
             for atom in atoms
-            if len(neighbor_list.get_neighbors(atom.index)[0]) < 3
-            and atom.symbol in {"C", "N"}
+            if atom.symbol == "C"
+            and len(neighbor_list.get_neighbors(atom.index)[0]) < 3
         ]
-
-        message = f"Added missing Hydrogen atoms: {need_hydrogen}."
 
         for index in need_hydrogen:
             vec = np.zeros(3)
@@ -93,326 +949,710 @@ class CdxmlUploadWidget(ipw.VBox):
                 vec += -atoms[index].position + (
                     atoms.positions[i] + np.dot(offset, atoms.get_cell())
                 )
-            vec = -vec / np.linalg.norm(vec) * 1.1 + atoms[index].position
-            atoms.append(ase.Atom("H", vec))
+            vec_norm = np.linalg.norm(vec)
+            if vec_norm > 1e-12:
+                position = -vec / vec_norm * 1.1 + atoms[index].position
+            else:
+                position = atoms[index].position + np.array([0.0, 0.0, 1.1])
+            atoms.append(ase.Atom("H", position))
 
-        return message, atoms
+        return (
+            f"Added missing Hydrogen atoms (safe hydrogenation): {need_hydrogen}.",
+            atoms,
+        )
 
-    def _on_file_upload(self, change=None):
-        """Handles the file upload event and converts CDXML to ASE Atoms."""
-        self.nunits.value = "Infinite"
-        self.nunits.disabled = True
+    # ---------------- Core conversion logic ----------------
+    @staticmethod
+    def symmetrize_carbon_network(
+        positions: np.ndarray,
+        symbols: list[str],
+        bonds: list[tuple[int, int]],
+        target_cc_length: float = 1.43,
+        minimum_cc_length: float = 1.35,
+        maximum_cc_length: float = 1.60,
+    ) -> np.ndarray:
+        """Relax a carbon drawing while preserving its planar graph embedding.
 
-        def get_unified_representation(value):
-            """This function ensures backwards compatibility w.r.t. ipywidgets 7.x"""
-            try:
-                return [
-                    (fname, item["content"]) for fname, item in value.items()
-                ]  # ipywidgets 7.x
-            except AttributeError:
-                return [
-                    (f["name"], f.content.tobytes()) for f in value
-                ]  # ipywidgets 8.x
+        The local sp2 preference is deliberately soft. Ring closure and fused
+        edges therefore distribute strain globally instead of forcing each
+        5-, 6-, or 7-membered face to become an independent regular polygon.
+        """
+        positions = np.asarray(positions, dtype=float)
+        carbon_indices = [
+            index for index, symbol in enumerate(symbols) if symbol == "C"
+        ]
+        local_index = {
+            atom_index: carbon_index
+            for carbon_index, atom_index in enumerate(carbon_indices)
+        }
+        carbon_edges = [
+            (local_index[first], local_index[second])
+            for first, second in bonds
+            if first in local_index and second in local_index
+        ]
+        if len(carbon_edges) < 3:
+            return positions.copy()
 
-        _, cdxml_content = get_unified_representation(change["new"])[0]
-        try:
-            self.atoms = self.cdxml_to_ase_from_string(cdxml_content)
-            (
-                self.crossing_points,
-                self.cdxml_atoms,
-                self.nunits.disabled,
-            ) = self.extract_crossing_and_atom_positions(cdxml_content)
-        except ValueError as exc:
-            self.output_message.value = f"Error: {exc}"
-        except Exception as exc:
-            self.output_message.value = f"Unexpected error: {exc}"
-
-    def _on_button_click(self, _=None):
-        """Handles the creation of the ASE model when 'Create model' button is clicked."""
-        if not self.atoms:
-            self.output_message.value = "Error: No atoms available to process."
-            return
-
-        atoms = self.atoms.copy()
-
-        if self.crossing_points is not None:
-            crossing_points = self.transform_points(
-                self.cdxml_atoms, atoms.positions, self.crossing_points
+        original = positions[carbon_indices, :2].copy()
+        if _has_bond_crossings(original, carbon_edges):
+            raise ValueError(
+                "the input carbon bonds already contain a geometric crossing"
             )
-            atoms = self.align_and_trim_atoms(
-                atoms, np.array(crossing_points), units=self.nunits.value
+
+        adjacency = [[] for _ in range(len(original))]
+        for first, second in carbon_edges:
+            adjacency[first].append(second)
+            adjacency[second].append(first)
+
+        angle_terms = []
+        for center, neighbors in enumerate(adjacency):
+            if len(neighbors) not in (2, 3):
+                continue
+            for first_index in range(len(neighbors)):
+                for second_index in range(first_index + 1, len(neighbors)):
+                    angle_terms.append(
+                        (center, neighbors[first_index], neighbors[second_index])
+                    )
+
+        faces = _bounded_faces(original, carbon_edges)
+        face_areas = [
+            (face, _signed_area(original[face]))
+            for face in faces
+            if abs(_signed_area(original[face])) > 1.0e-8
+        ]
+
+        def residual(flat_positions):
+            current = flat_positions.reshape((-1, 2))
+            values: list[float] = [
+                float(
+                    (
+                        np.linalg.norm(current[second] - current[first])
+                        - target_cc_length
+                    )
+                    / 0.04
+                )
+                for first, second in carbon_edges
+            ]
+            for center, first, second in angle_terms:
+                first_vector = current[first] - current[center]
+                second_vector = current[second] - current[center]
+                denominator = np.linalg.norm(first_vector) * np.linalg.norm(
+                    second_vector
+                )
+                cosine = np.dot(first_vector, second_vector) / max(denominator, 1.0e-12)
+                values.append(float(math.sqrt(0.10) * (cosine + 0.5) / 0.15))
+
+            # Keep the user's global layout while allowing local cleanup.
+            values.extend((math.sqrt(0.10) * (current - original) / 0.20).ravel())
+
+            # This barrier protects every detected face from collapse or inversion.
+            for face, original_area in face_areas:
+                area_ratio = _signed_area(current[face]) / original_area
+                values.append(math.sqrt(20.0) * max(0.0, 0.35 - area_ratio))
+            return np.asarray(values)
+
+        maximum_displacement = 0.75
+        result = least_squares(
+            residual,
+            original.ravel(),
+            bounds=(
+                (original - maximum_displacement).ravel(),
+                (original + maximum_displacement).ravel(),
+            ),
+            max_nfev=200,
+            ftol=1.0e-9,
+            xtol=1.0e-9,
+            gtol=1.0e-9,
+        )
+        if not result.success:
+            raise ValueError(f"geometry optimizer did not converge: {result.message}")
+
+        optimized = result.x.reshape((-1, 2))
+        lengths = np.array(
+            [
+                np.linalg.norm(optimized[second] - optimized[first])
+                for first, second in carbon_edges
+            ]
+        )
+        if (
+            np.min(lengths) < minimum_cc_length - 1.0e-6
+            or np.max(lengths) > maximum_cc_length + 1.0e-6
+        ):
+            raise ValueError(
+                "optimized C-C lengths fall outside "
+                f"{minimum_cc_length:.2f}-{maximum_cc_length:.2f} Å"
             )
-        else:
-            self.output_message.value = "Error: No 'crossing points' found."
-            return
+        if _has_bond_crossings(optimized, carbon_edges):
+            raise ValueError("geometry cleanup would create crossing carbon bonds")
 
-        if self.nunits.disabled:
-            extra_cell = 15.0
-            atoms.cell = (np.ptp(atoms.positions, axis=0)) + extra_cell
-            atoms.center()
+        for face, original_area in face_areas:
+            optimized_area = _signed_area(optimized[face])
+            if optimized_area * original_area <= 0.0 or abs(
+                optimized_area
+            ) < 0.25 * abs(original_area):
+                raise ValueError(
+                    "geometry cleanup would invert or collapse a carbon face"
+                )
 
-        if self.nunits.value == "Infinite":
-            atoms.pbc = True
+        updated = positions.copy()
+        carbon_displacements = optimized - original
+        updated[carbon_indices, :2] = optimized
 
-        self.output_message.value, self.structure = self.add_hydrogen_atoms(atoms)
+        # Move explicit substituents with the carbon atoms to which they are bound.
+        carbon_neighbors = {index: [] for index in range(len(positions))}
+        for first, second in bonds:
+            if first in local_index and second not in local_index:
+                carbon_neighbors[second].append(first)
+            if second in local_index and first not in local_index:
+                carbon_neighbors[first].append(second)
+        for atom_index, neighbors in carbon_neighbors.items():
+            if not neighbors or atom_index in local_index:
+                continue
+            displacement = np.mean(
+                [carbon_displacements[local_index[index]] for index in neighbors],
+                axis=0,
+            )
+            updated[atom_index, :2] += displacement
+
+        return updated
 
     @staticmethod
     def cdxml_to_ase_from_string(
-        cdxml_content: str, target_cc_distance: float = 1.43
-    ) -> ase.Atoms:
+        cdxml_content: str | bytes,
+        target_cc_length: float = 1.43,
+        symmetrize: bool = False,
+    ) -> tuple[str, Atoms, Atoms]:
         """
-        Converts CDXML content provided as a string into an ASE Atoms object,
-        scaling coordinates so that the smallest C-C distance is target_cc_distance (default: 1.43 Å).
-        Atoms without an 'Element' attribute are considered Carbon ('C').
-        Atoms with an 'Element' attribute use the periodic table symbol.
-
-        Args:
-            cdxml_content (str): The content of the CDXML file as a string.
-            target_cc_distance (float): Desired minimum C-C distance (default: 1.43 Å).
-
-        Returns:
-            Atoms: An ASE Atoms object with scaled coordinates.
+        Convert CDXML content (string) into ASE Atoms objects:
+        one bare molecule (no hydrogens) and one with hydrogens.
         """
-        # Parse the CDXML content from the string
         root = ET.fromstring(cdxml_content)
 
-        # Extract atom data from 'n' elements
-        symbols = []
-        positions = []
+        # --- Element and bond maps ---
+        element_map = {
+            "1": "H",
+            "5": "B",
+            "6": "C",
+            "7": "N",
+            "8": "O",
+            "9": "F",
+            "15": "P",
+            "16": "S",
+            "17": "Cl",
+            "26": "Fe",
+            "27": "Co",
+            "28": "Ni",
+            "22": "Ti",
+            "40": "Zr",
+            "65": "Tb",
+            "35": "Br",
+            "53": "I",
+        }
 
-        for atom in root.findall(".//n"):
-            # Determine the element symbol
-            if "Element" in atom.attrib:
-                # Convert atomic number to element symbol using ASE's chemical_symbols
-                element_number = int(atom.get("Element"))
-                if element_number < len(chemical_symbols):
-                    element = chemical_symbols[element_number]
-                else:
-                    raise ValueError(
-                        f"Unknown atomic number {element_number} in CDXML content."
-                    )
+        default_valence = {
+            "H": 1,
+            "B": 3,
+            "C": 4,
+            "N": 3,
+            "O": 2,
+            "F": 1,
+            "P": 3,
+            "S": 2,
+            "Cl": 1,
+            "Br": 1,
+            "I": 1,
+            "Fe": 2,
+            "Co": 2,
+            "Ni": 2,
+            "Ti": 4,
+            "Zr": 4,
+            "Tb": 3,
+        }
+
+        bond_order_map = {
+            "1": 1.0,  # single bond
+            "2": 2.0,  # double bond
+            "3": 3.0,  # triple bond
+            "A": 1.5,  # aromatic bond
+        }
+
+        atoms, bonds, radicals = {}, [], set()
+
+        # --- Parse atoms ---
+        for n in root.iter("n"):
+            a_id = n.attrib["id"]
+            el = element_map.get(n.attrib.get("Element", ""), "C")
+            x, y = map(float, n.attrib["p"].split())
+            atoms[a_id] = {"el": el, "pos": np.array([x, y, 0.0])}
+            if "Radical" in n.attrib:
+                radicals.add(a_id)
+
+        for g in root.iter("graphic"):
+            if g.attrib.get("SymbolType") == "Electron":
+                for rep in g.iter("represent"):
+                    target = rep.attrib.get("object")
+                    if target:
+                        radicals.add(target)
+
+        # --- Parse bonds ---
+        for b in root.iter("b"):
+            a1, a2 = b.attrib["B"], b.attrib["E"]
+            order = bond_order_map.get(b.attrib.get("Order", "1"), 1.0)
+            bonds.append({"a1": a1, "a2": a2, "order": order})
+
+        # --- Scale from explicit C-C bonds, never from unrelated close atoms ---
+        cc_lengths = [
+            np.linalg.norm(atoms[bond["a1"]]["pos"] - atoms[bond["a2"]]["pos"])
+            for bond in bonds
+            if atoms[bond["a1"]]["el"] == atoms[bond["a2"]]["el"] == "C"
+        ]
+        scale = target_cc_length / np.median(cc_lengths) if cc_lengths else 1.0
+        for atom in atoms.values():
+            atom["pos"] *= scale
+
+        geometry_message = "Original CDXML geometry retained."
+        if symmetrize:
+            atom_ids = list(atoms)
+            atom_index = {atom_id: index for index, atom_id in enumerate(atom_ids)}
+            positions = np.array([atoms[atom_id]["pos"] for atom_id in atom_ids])
+            symbols = [atoms[atom_id]["el"] for atom_id in atom_ids]
+            edge_indices = [
+                (atom_index[bond["a1"]], atom_index[bond["a2"]]) for bond in bonds
+            ]
+            try:
+                positions = CdxmlUploadWidget.symmetrize_carbon_network(
+                    positions,
+                    symbols,
+                    edge_indices,
+                    target_cc_length=target_cc_length,
+                )
+            except ValueError as exc:
+                geometry_message = (
+                    "⚠️ Carbon geometry cleanup skipped: "
+                    f"{exc}. Original scaled geometry retained."
+                )
             else:
-                # Default to Carbon ('C') if no Element attribute is present
-                element = "C"
+                for atom_id, position in zip(atom_ids, positions):
+                    atoms[atom_id]["pos"] = position
+                geometry_message = (
+                    "Carbon geometry cleaned globally; planar embedding preserved "
+                    "and C-C bonds constrained to 1.35-1.60 Å."
+                )
 
-            symbols.append(element)
+        # --- Connectivity ---
+        conn = {k: [] for k in atoms}
+        for b in bonds:
+            conn[b["a1"]].append((b["a2"], b["order"]))
+            conn[b["a2"]].append((b["a1"], b["order"]))
 
-            # Get 2D coordinates from 'p' attribute and assume z=0
-            p = atom.get("p", "0 0").split()
-            x, y = float(p[0]), float(p[1])
-            positions.append([x, y, 0.0])
+        # --- Bare molecule ---
+        bare_pos = [a["pos"] for a in atoms.values()]
+        bare_sym = [a["el"] for a in atoms.values()]
+        bare_mol = Atoms(symbols=bare_sym, positions=bare_pos)
 
-        if not symbols or not positions:
-            raise ValueError("No valid atoms found in the CDXML content.")
+        # --- Determine implicit hydrogens ---
+        impl_H = {}
+        for aid, a in atoms.items():
+            el = a["el"]
+            total = sum(o for _, o in conn[aid])
+            val = default_valence.get(el, 4)
+            if aid in radicals:
+                val -= 1
+            impl_H[aid] = max(0, round(val - total))
 
-        # Convert positions to a numpy array
-        positions = np.array(positions)
+        # --- Add hydrogens ---
+        pos, sym = list(bare_pos), list(bare_sym)
+        for aid, nH in impl_H.items():
+            if nH == 0:
+                continue
 
-        # Find the smallest C-C distance
-        carbon_indices = [i for i, sym in enumerate(symbols) if sym == "C"]
-        if len(carbon_indices) < 2:
-            raise ValueError("Not enough Carbon atoms to calculate C-C distance.")
+            el = atoms[aid]["el"]
+            c = atoms[aid]["pos"]
+            neighbors = [normalize(atoms[n]["pos"] - c) for n, _ in conn[aid]]
+            orders = [o for _, o in conn[aid]]
 
-        # Calculate pairwise distances between all Carbon atoms
-        carbon_positions = positions[carbon_indices]
-        cc_distances = pdist(carbon_positions)
+            def add_H(
+                vecs: list[np.ndarray], length: float = 1.09, center: np.ndarray = c
+            ):
+                for v in vecs:
+                    pos.append(center + length * v)
+                    sym.append("H")
 
-        # Find the minimum C-C distance
-        min_cc_distance = np.min(cc_distances)
+            # --- Oxygen or Nitrogen (improved geometry) ---
+            if el in ("O", "N"):
+                v_sum = np.sum(neighbors, axis=0) if neighbors else np.zeros(3)
+                base_dir = (
+                    normalize(-v_sum)
+                    if np.linalg.norm(v_sum) > 1e-6
+                    else np.array([0, 0, 1])
+                )
 
-        # Scale coordinates to set the minimum C-C distance to target_cc_distance
-        scale_factor = target_cc_distance / min_cc_distance
-        positions *= scale_factor
+                # --- Single hydrogen (OH, NH) ---
+                if nH == 1:
+                    if el == "O" and len(neighbors) == 1:
+                        # OH: tilt the H about 35° out of the opposite direction (~105° angle)
+                        v = neighbors[0]
+                        # Keep hydrogen roughly in the same molecular plane
+                        rot_axis = np.array([0, 0, 1])
+                        if np.allclose(np.abs(np.dot(v, rot_axis)), 1.0):
+                            rot_axis = np.array([1, 0, 0])
+                        dirs = [rotate_vector(-v, rot_axis, math.radians(35))]
+                        add_H(dirs, 0.98)
+                    else:
+                        # Default for NH etc.
+                        add_H([base_dir], 1.00 if el == "N" else 0.98)
+                    continue
 
-        # Create an ASE Atoms object with the scaled positions
-        ase_atoms = ase.Atoms(symbols=symbols, positions=positions)
+                # --- Two hydrogens (H2O, NH2) ---
+                if nH == 2:
+                    theta = math.radians(104.5 if el == "O" else 107.0)
+                    rot_axis = np.array([0, 0, 1])
+                    if np.allclose(np.abs(np.dot(base_dir, rot_axis)), 1.0):
+                        rot_axis = np.array([1, 0, 0])
+                    dirs = [
+                        rotate_vector(base_dir, rot_axis, math.radians(a))
+                        for a in (-theta / 2, theta / 2)
+                    ]
+                    add_H(dirs, 0.98 if el == "O" else 1.00)
+                    continue
 
-        return ase_atoms
+            # --- Other heteroatoms (unchanged behaviour) ---
+            if el != "C":
+                avg = (
+                    normalize(-np.sum(neighbors, axis=0))
+                    if neighbors
+                    else np.array([0, 0, 1])
+                )
+                add_H([avg], 1.01)
+                continue
 
+            # --- Carbon atoms (original logic, untouched) ---
+
+            # CH3
+            if nH == 3 and len(neighbors) == 1:
+                v = neighbors[0]
+                theta = math.radians(109.47)
+                dirs = [
+                    np.array(
+                        [
+                            math.sin(theta) * math.cos(p),
+                            math.sin(theta) * math.sin(p),
+                            math.cos(theta),
+                        ]
+                    )
+                    for p in (0, 2 * math.pi / 3, 4 * math.pi / 3)
+                ]
+                R = rotation_matrix_from_vectors(np.array([0, 0, 1]), -v)
+                add_H([-R @ d for d in dirs], 1.10)
+                continue
+
+            # CH2
+            if nH == 2:
+                CH_len = 1.09 if any(o >= 1.5 for o in orders) else 1.10
+                if len(neighbors) == 1:
+                    v = neighbors[0]
+                    if any(o >= 1.5 for o in orders):
+                        normal = np.array([0, 0, 1])
+                        bis = -v
+                        add_H(
+                            [
+                                rotate_vector(bis, normal, math.radians(a))
+                                for a in (60, -60)
+                            ],
+                            CH_len,
+                        )
+                    else:
+                        theta = math.radians(109.47)
+                        dirs = [
+                            np.array(
+                                [
+                                    math.sin(theta) * math.cos(p),
+                                    math.sin(theta) * math.sin(p),
+                                    math.cos(theta),
+                                ]
+                            )
+                            for p in (0, 2 * math.pi / 3)
+                        ]
+                        R = rotation_matrix_from_vectors(np.array([0, 0, 1]), -v)
+                        add_H([R @ d for d in dirs], CH_len)
+                    continue
+
+                if len(neighbors) == 2:
+                    v1, v2 = neighbors
+                    bis = normalize(-(v1 + v2))
+                    plane_normal = normalize(np.cross(v1, v2))
+                    if any(o >= 1.5 for o in orders):
+                        add_H(
+                            [
+                                rotate_vector(bis, plane_normal, math.radians(a))
+                                for a in (60, -60)
+                            ],
+                            CH_len,
+                        )
+                    else:
+                        angle = math.radians(54.75)
+                        perp = normalize(np.cross(v1, v2))
+                        add_H(
+                            [
+                                math.cos(angle) * bis + math.sin(angle) * perp,
+                                math.cos(angle) * bis - math.sin(angle) * perp,
+                            ],
+                            CH_len,
+                        )
+                    continue
+
+            # CH
+            if nH == 1:
+                avg = normalize(-np.sum(neighbors, axis=0))
+                add_H([avg], 1.09)
+
+        mol = Atoms(symbols=sym, positions=pos)
+        msg = geometry_message
+        return msg, bare_mol, mol
+
+    # ---------------- Geometry utilities ----------------
     @staticmethod
-    def transform_points(set1, set2, points):
-        """
-        Transform a set of points based on the scaling and rotation that aligns set1 to set2.
-
-        Args:
-            set1 (list of tuples): Reference set of points (e.g., [(x1, y1), ...]).
-            set2 (list of tuples): Transformed set of points (e.g., [(x2, y2), ...]).
-            points (list of tuples): Points to transform (e.g., [(px1, py1), ...]).
-
-        Returns:
-            list of tuples: Transformed points.
-        """
-        # set1 = np.array(set1)
-        # set2 = np.array(set2)
-        # points = np.array(points)
-
-        # Compute centroids of set1 and set2
-        centroid1 = np.mean(set1, axis=0)
-        centroid2 = np.mean(set2, axis=0)
-
-        # Center the sets around their centroids
-        centered_set1 = set1 - centroid1
-        centered_set2 = set2 - centroid2
-
-        # Compute the scaling factor
-        norm1 = np.linalg.norm(centered_set1, axis=1).mean()
-        norm2 = np.linalg.norm(centered_set2, axis=1).mean()
-        scale = norm2 / norm1
-
-        # Compute the rotation matrix using Singular Value Decomposition (SVD)
-        cross_covariance = np.dot(centered_set1.T, centered_set2)
-        u_matrix, _, vt_matrix = np.linalg.svd(cross_covariance)
-        rotation_m = np.dot(vt_matrix.T, u_matrix.T)  # Rotation matrix
-
-        # Apply the scaling and rotation to the points
-        transformed_points = (
-            scale * np.dot(points - centroid1, rotation_m.T) + centroid2
+    def transform_points(
+        set1: np.ndarray, set2: np.ndarray, points: np.ndarray
+    ) -> list[list[float]]:
+        """Transform points based on scaling and rotation aligning set1→set2."""
+        centroid1, centroid2 = np.mean(set1, axis=0), np.mean(set2, axis=0)
+        centered1, centered2 = set1 - centroid1, set2 - centroid2
+        scale = (
+            np.linalg.norm(centered2, axis=1).mean()
+            / np.linalg.norm(centered1, axis=1).mean()
         )
-
-        return transformed_points.tolist()
+        cross_cov = np.dot(centered1.T, centered2)
+        u, _, vt = np.linalg.svd(cross_cov)
+        rotation_m = np.dot(vt.T, u.T)
+        return (scale * np.dot(points - centroid1, rotation_m.T) + centroid2).tolist()
 
     @staticmethod
-    def max_extension_points(points):
-        """
-        Given a list of points, checks whether the maximum extension is along the x-axis or y-axis,
-        and returns two points accordingly.
-
-        Args:
-            points (list of tuple): List of points as (x, y, z) coordinates.
-
-        Returns:
-            tuple: Two points as ((x1, y1, z1), (x2, y2, z2))
-        """
-        # Unpack x, y, and z coordinates
-        x_coords = [p[0] for p in points]
-        y_coords = [p[1] for p in points]
-
-        # Calculate the range along x and y
-        x_range = max(x_coords) - min(x_coords)
-        y_range = max(y_coords) - min(y_coords)
-
-        # Determine the points based on the largest range
+    def max_extension_points(points: np.ndarray) -> np.ndarray:
+        """Return two points defining the maximum extension of a set of 3D points."""
+        x_range, y_range = np.ptp(points[:, 0]), np.ptp(points[:, 1])
         if x_range >= y_range:
-            minx, maxx = min(x_coords), max(x_coords)
+            minx, maxx = np.min(points[:, 0]), np.max(points[:, 0])
             return np.array([[minx - 7.5, 0, 0], [maxx + 7.5, 0, 0]])
-        else:
-            miny, maxy = min(y_coords), max(y_coords)
-            return np.array([[0, miny - 7.5, 0], [0, maxy + 7.5, 0]])
+        miny, maxy = np.min(points[:, 1]), np.max(points[:, 1])
+        return np.array([[0, miny - 7.5, 0], [0, maxy + 7.5, 0]])
 
-    def extract_crossing_and_atom_positions(self, cdxml_content: str):
-        """
-        Extract the first two crossing points such that the vector connecting them is aligned with the unit vector.
+    # ---------------- CDXML analysis ----------------
+    def extract_crossing_and_atom_positions(
+        self,
+        cdxml_content: str | bytes,
+        atom_positions_override: np.ndarray | None = None,
+    ) -> tuple[np.ndarray | None, np.ndarray, bool]:
+        """Extract robust periodic boundaries and atom positions from CDXML.
 
-        Args:
-            cdxml_content (str): The content of the CDXML file as a string.
-
-        Returns:
-            tuple: Three values:
-                - crossing_points_pair: A tuple of two crossing points that are aligned with the unit vector.
-                  The unit_vector is a vector with positive x and y, parallel to the vector connecting the square brackets
-                - atom_positions: Atom positions as a numpy array of shape (M, 3).
-                - isnotperiodic (bool): Indicates whether the structure is non-periodic.
+        ChemDraw may serialize the right bracket before the left bracket. Crossing
+        matching must therefore be independent of both XML order and vector sign.
         """
         root = ET.fromstring(cdxml_content)
 
-        # Parse all atom positions
-        atom_positions = []
-        atom_id_map = {}
+        atom_positions, atom_id_map = [], {}
         for node in root.findall(".//n"):
             atom_id = node.get("id")
             if atom_id and "p" in node.attrib:
-                position = tuple(map(float, node.attrib["p"].split()))
-                atom_positions.append((position[0], position[1], 0.0))  # Add z=0
-                atom_id_map[atom_id] = len(atom_positions) - 1  # Map atom ID to index
+                x, y = map(float, node.attrib["p"].split())
+                atom_positions.append((x, y, 0.0))
+                atom_id_map[atom_id] = len(atom_positions) - 1
+        atom_positions = np.asarray(atom_positions, dtype=float)
+        drawing_atom_positions = atom_positions.copy()
 
-        atom_positions = np.array(atom_positions)
+        if atom_positions_override is not None:
+            override = np.asarray(atom_positions_override, dtype=float)
+            if len(override) != len(atom_positions):
+                raise ValueError(
+                    "atom position override does not match the CDXML atom count"
+                )
+            if override.shape[1] == 2:
+                override = np.column_stack([override, np.zeros(len(override))])
+            if override.shape != atom_positions.shape:
+                raise ValueError(
+                    "atom position override must have shape (N, 2) or (N, 3)"
+                )
+            atom_positions = override.copy()
 
-        # Parse crossing bonds and compute crossing points
-        crossing_points = []
+        bonds_by_id = {
+            bond.get("id"): bond for bond in root.findall(".//b") if bond.get("id")
+        }
 
-        for crossing in root.findall(".//crossingbond"):
-            bond_id = crossing.get("BondID")
+        def bond_midpoint(bond_id):
+            bond = bonds_by_id.get(bond_id)
+            if bond is None:
+                return None
+            first, second = bond.get("B"), bond.get("E")
+            if first not in atom_id_map or second not in atom_id_map:
+                return None
+            return 0.5 * (
+                atom_positions[atom_id_map[first]] + atom_positions[atom_id_map[second]]
+            )
 
-            if bond_id:
-                bond = root.find(f".//b[@id='{bond_id}']")
-                if bond is not None:
-                    start_id = bond.get("B")
-                    end_id = bond.get("E")
-                    if start_id in atom_id_map and end_id in atom_id_map:
-                        start_pos = atom_positions[atom_id_map[start_id]]
-                        end_pos = atom_positions[atom_id_map[end_id]]
+        bracket_centers = {}
+        for graphic in root.iter("graphic"):
+            if (
+                graphic.attrib.get("BracketType") != "Square"
+                or "BoundingBox" not in graphic.attrib
+            ):
+                continue
+            coordinates = [
+                float(value) for value in graphic.attrib["BoundingBox"].split()
+            ]
+            if len(coordinates) != 4:
+                continue
+            x_min, y_min, x_max, y_max = coordinates
+            bracket_centers[graphic.get("id")] = np.array(
+                [(x_min + x_max) / 2, (y_min + y_max) / 2, 0.0]
+            )
 
-                        midpoint = (
-                            (start_pos[0] + end_pos[0]) / 2,
-                            (start_pos[1] + end_pos[1]) / 2,
-                            0.0,  # Add z=0
+        if atom_positions_override is not None and bracket_centers:
+            bracket_ids = list(bracket_centers)
+            transformed_centers = self.transform_points(
+                drawing_atom_positions,
+                atom_positions,
+                np.array([bracket_centers[bracket_id] for bracket_id in bracket_ids]),
+            )
+            bracket_centers = {
+                bracket_id: np.asarray(center)
+                for bracket_id, center in zip(bracket_ids, transformed_centers)
+            }
+
+        if not bracket_centers:
+            return self.max_extension_points(atom_positions), atom_positions, True
+
+        def matched_boundary_points(
+            first_center,
+            second_center,
+            first_crossings,
+            second_crossings,
+        ):
+            bracket_vector = second_center[:2] - first_center[:2]
+            bracket_distance = np.linalg.norm(bracket_vector)
+            if bracket_distance < 1.0e-12:
+                return None
+            axis = bracket_vector / bracket_distance
+            transverse_axis = np.array([-axis[1], axis[0]])
+            matched_pairs = []
+            for first_point in first_crossings:
+                for second_point in second_crossings:
+                    vector = second_point[:2] - first_point[:2]
+                    distance = np.linalg.norm(vector)
+                    if distance < 1.0e-12:
+                        continue
+                    alignment = abs(np.dot(vector / distance, axis))
+                    transverse = abs(np.dot(vector, transverse_axis))
+                    projection = abs(np.dot(vector, axis))
+                    if alignment > 0.99 and transverse < max(
+                        0.5, 0.05 * bracket_distance
+                    ):
+                        matched_pairs.append(
+                            (
+                                transverse,
+                                abs(projection - bracket_distance),
+                                -alignment,
+                                np.array([first_point, second_point]),
+                            )
                         )
-                        crossing_points.append(midpoint)
+            if not matched_pairs:
+                return None
 
-        crossing_points = np.array(crossing_points)
+            best_pair = min(
+                matched_pairs,
+                key=lambda pair: (pair[0], pair[1], pair[2]),
+            )
+            return (
+                -best_pair[2],
+                -best_pair[0],
+                best_pair[3],
+            )
 
-        # Parse square parentheses
-        brackets = []
-        for graphic in root.findall(".//graphic[@BracketType='Square']"):
-            if "BoundingBox" in graphic.attrib:
-                bb = list(map(float, graphic.attrib["BoundingBox"].split()))
-                x_min, y_min, x_max, y_max = bb
+        candidates = []
+        for group in root.findall(".//bracketedgroup"):
+            attachments = []
+            for attachment in group.findall("./bracketattachment"):
+                graphic_id = attachment.get("GraphicID")
+                if graphic_id not in bracket_centers:
+                    continue
+                points = []
+                for crossing in attachment.findall("./crossingbond"):
+                    midpoint = bond_midpoint(crossing.get("BondID"))
+                    if midpoint is not None:
+                        points.append(midpoint)
+                if points:
+                    attachments.append(
+                        (bracket_centers[graphic_id], np.asarray(points))
+                    )
 
-                midpoint = ((x_min + x_max) / 2, (y_min + y_max) / 2, 0.0)
-                brackets.append(midpoint)
+            for first_index in range(len(attachments)):
+                for second_index in range(first_index + 1, len(attachments)):
+                    candidate = matched_boundary_points(
+                        attachments[first_index][0],
+                        attachments[second_index][0],
+                        attachments[first_index][1],
+                        attachments[second_index][1],
+                    )
+                    if candidate is not None:
+                        candidates.append(candidate)
 
-        isnotperiodic = True
-        if len(brackets) == 0:
-            twopoints = self.max_extension_points(atom_positions)
-            return twopoints, atom_positions, isnotperiodic
+        if candidates:
+            _, _, boundaries = max(
+                candidates, key=lambda candidate: (candidate[0], candidate[1])
+            )
+            return boundaries, atom_positions, False
 
-        if len(brackets) == 2:
-            brackets = np.array(brackets)
-            vector = brackets[1] - brackets[0]
-            unit_vector = vector[:2] / np.linalg.norm(vector[:2])
+        # Compatibility path for CDXML writers that omit bracketattachment groups.
+        centers = list(bracket_centers.values())
+        crossing_points = [
+            midpoint
+            for crossing in root.findall(".//crossingbond")
+            if (midpoint := bond_midpoint(crossing.get("BondID"))) is not None
+        ]
+        if len(centers) == 2 and crossing_points:
+            candidate = matched_boundary_points(
+                centers[0],
+                centers[1],
+                crossing_points,
+                crossing_points,
+            )
+            if candidate is not None:
+                return candidate[2], atom_positions, False
 
-            if unit_vector[0] < 0 or unit_vector[1] < 0:
-                unit_vector = -unit_vector
-
-            for i in range(len(crossing_points)):
-                for j in range(i + 1, len(crossing_points)):
-                    vector = crossing_points[j][:2] - crossing_points[i][:2]
-                    unit_test_vector = vector / np.linalg.norm(vector)
-                    if np.dot(unit_test_vector, unit_vector) > 0.99:
-                        isnotperiodic = False
-                        return crossing_points[[i, j]], atom_positions, isnotperiodic
+        # Square brackets still define a repeat interval even when a writer does
+        # not provide usable crossing-bond metadata.
+        if len(centers) == 2:
+            return np.asarray(centers), atom_positions, False
 
         return None, atom_positions, True
 
+    # ---------------- Alignment & trimming ----------------
     @staticmethod
-    def align_and_trim_atoms(atoms, crossing_points, units=None):
+    def align_and_trim_atoms(
+        atoms: Atoms,
+        crossing_points: np.ndarray,
+        units: str | None = None,
+        original_atoms: Atoms | None = None,
+    ) -> Atoms:
         """
-        Aligns an ASE Atoms object with the x-axis based on two crossing points,
-        trims or replicates atoms based on specified x-bounds, sets a new unit cell, and centers the structure.
-
-        Args:
-            atoms (ASE.Atoms): The ASE Atoms object to transform.
-            crossing_points (numpy.ndarray): A 2x3 NumPy array containing two crossing points.
-            n_units (int, optional): Number of units to replicate along the x-axis. If None, trims atoms.
-
-        Returns:
-            ASE.Atoms: The transformed ASE Atoms object.
+        Align, trim, and optionally replicate atoms along the periodic direction.
+        Restores hydrogens lost during trimming using original geometry.
         """
-        # Ensure crossing_points is a 2x3 array
-        assert crossing_points.shape == (
-            2,
-            3,
-        ), "crossing_points must be a 2x3 NumPy array."
+        assert crossing_points.shape == (2, 3), (
+            "crossing_points must be a 2x3 NumPy array."
+        )
 
-        # Calculate the vector connecting the two crossing points
         vector = crossing_points[1] - crossing_points[0]
         norm_vector = np.linalg.norm(vector)
-
-        # Calculate rotation angle to align the vector with the x-axis
         angle = np.arctan2(vector[1], vector[0])
 
-        # Rotate the atoms and crossing points
-        atoms.rotate(-np.degrees(angle), "z", center=(0, 0, 0))
+        def rotate_atoms(atoms_obj: Atoms) -> Atoms:
+            atoms_copy = atoms_obj.copy()
+            atoms_copy.rotate(-np.degrees(angle), "z", center=(0, 0, 0))
+            return atoms_copy
+
+        atoms_rot = rotate_atoms(atoms)
+        orig_rot = rotate_atoms(original_atoms if original_atoms is not None else atoms)
+
         rotation_matrix = np.array(
             [
                 [np.cos(-angle), -np.sin(-angle), 0],
@@ -420,60 +1660,101 @@ class CdxmlUploadWidget(ipw.VBox):
                 [0, 0, 1],
             ]
         )
-        rotated_crossing_points = np.dot(crossing_points, rotation_matrix.T)
+        rotated_cp = np.dot(crossing_points, rotation_matrix.T)
+        x_min, x_max = min(rotated_cp[:, 0]), max(rotated_cp[:, 0]) + 0.1
 
-        # Define x-bounds based on crossing points
-        x_min = min(rotated_crossing_points[:, 0])
-        x_max = max(rotated_crossing_points[:, 0]) + 0.1
+        pos = atoms_rot.get_positions()
+        mask_main, mask_tail, mask_head = (
+            (pos[:, 0] > x_min) & (pos[:, 0] <= x_max),
+            pos[:, 0] <= x_min,
+            pos[:, 0] > x_max,
+        )
+        bounded_atoms, tail_atoms, head_atoms = (
+            atoms_rot[mask_main].copy(),
+            atoms_rot[mask_tail].copy(),
+            atoms_rot[mask_head].copy(),
+        )
+        kept_indices = np.where(mask_main)[0]
 
-        # Extract positions and define the mask for atoms within bounds
-        positions = atoms.get_positions()
-        mask = (positions[:, 0] > x_min) & (positions[:, 0] <= x_max)
-        bounded_atoms = atoms[mask].copy()
-        mask = positions[:, 0] <= x_min
-        tail_atoms = atoms[mask].copy()
-        mask = positions[:, 0] > x_max
-        head_atoms = atoms[mask].copy()
-        try:
-            n_units = int(units)
-        except ValueError:
+        nl = NeighborList(
+            [covalent_radii[num] * 1.2 for num in orig_rot.numbers],
+            self_interaction=False,
+            bothways=True,
+        )
+        nl.update(orig_rot)
+        symbols = orig_rot.get_chemical_symbols()
+
+        restored_positions, restored_symbols = [], []
+        for i in kept_indices:
+            if symbols[i] == "H":
+                continue
+            indices, _ = nl.get_neighbors(i)
+            for j in indices:
+                if symbols[j] == "H":
+                    h_pos = orig_rot.positions[j]
+                    if not (x_min < h_pos[0] <= x_max):
+                        restored_positions.append(h_pos)
+                        restored_symbols.append("H")
+
+        if restored_positions:
+            bounded_atoms += ase.Atoms(restored_symbols, positions=restored_positions)
+
+        if units is None:
             n_units = None
+        else:
+            try:
+                n_units = int(units)
+            except ValueError:
+                n_units = None
 
         if n_units is None or n_units < 1:
-            # Trim atoms based on x-bounds
-            atoms = bounded_atoms
+            atoms_final = bounded_atoms
         else:
-            # Replicate atoms for n_units
             replicated_atoms = bounded_atoms.copy()
             for ni in range(1, n_units):
-                shifted_positions = bounded_atoms.get_positions() + np.array(
+                shifted = bounded_atoms.get_positions() + np.array(
                     [ni * norm_vector, 0, 0]
                 )
                 replicated_atoms += ase.Atoms(
-                    bounded_atoms.get_chemical_symbols(), positions=shifted_positions
+                    bounded_atoms.get_chemical_symbols(), positions=shifted
                 )
-
-            # Add atoms shifted beyond xmax
-            shifted_positions = head_atoms.get_positions() + np.array(
+            shifted_head = head_atoms.get_positions() + np.array(
                 [(n_units - 1) * norm_vector, 0, 0]
             )
             replicated_atoms += ase.Atoms(
-                head_atoms.get_chemical_symbols(), positions=shifted_positions
+                head_atoms.get_chemical_symbols(), positions=shifted_head
             )
             replicated_atoms += tail_atoms
-            atoms = replicated_atoms
+            atoms_final = replicated_atoms
 
-        # Set the new unit cell
+        # Hydrogens restored across a periodic cut can overlap a carbon on the
+        # opposite boundary. Such atoms are trimming artefacts, not chemistry.
+        symbols = np.asarray(atoms_final.get_chemical_symbols())
+        hydrogen_indices = np.where(symbols == "H")[0]
+        heavy_indices = np.where(symbols != "H")[0]
+        keep = np.ones(len(atoms_final), dtype=bool)
+        for hydrogen_index in hydrogen_indices:
+            if not len(heavy_indices):
+                keep[hydrogen_index] = False
+                continue
+            nearest_heavy = np.min(
+                np.linalg.norm(
+                    atoms_final.positions[heavy_indices]
+                    - atoms_final.positions[hydrogen_index],
+                    axis=1,
+                )
+            )
+            if nearest_heavy < 0.70 or nearest_heavy > 1.35:
+                keep[hydrogen_index] = False
+        atoms_final = atoms_final[keep]
+
         if n_units is None or n_units < 1:
-            l1 = norm_vector
-            atoms.set_periodic = True
+            l1, atoms_final.pbc = norm_vector, [True, False, False]
         else:
-            l1 = (
-                np.ptp(atoms.get_positions()[:, 0]) + 15.0
-            )  # Size in x-direction + 10 Å
-        l2 = 15.0 + np.ptp(atoms.get_positions()[:, 1])  # Size in y-direction + 15 Å
-        l3 = 15.0  # Fixed value
-        atoms.set_cell([l1, l2, l3])
-        atoms.center()
+            l1 = np.ptp(atoms_final.get_positions()[:, 0]) + 15.0
+        l2 = 15.0 + np.ptp(atoms_final.get_positions()[:, 1])
+        l3 = 15.0
+        atoms_final.set_cell([l1, l2, l3])
+        atoms_final.center()
 
-        return atoms
+        return atoms_final
