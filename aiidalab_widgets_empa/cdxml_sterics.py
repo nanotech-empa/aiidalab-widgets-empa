@@ -12,8 +12,43 @@ from dataclasses import dataclass
 
 import numpy as np
 from ase import Atoms
-from ase.data import vdw_radii
+from ase.data import covalent_radii, vdw_radii
 from scipy.optimize import least_squares, minimize
+
+
+MINIMUM_CONTACT_DISTANCES = {("C", "C"): 1.70, ("C", "H"): 1.30, ("H", "H"): 0.80}
+
+
+def _contact_floors(
+    atoms, pairs, mode, contact_scale, minimum_distances, margin_percent
+):
+    """Build distance floors; minimal mode must stay beyond viewer bond cutoffs."""
+    if mode == "steric":
+        radii = vdw_radii[atoms.numbers]
+        return contact_scale * (radii[pairs[:, 0]] + radii[pairs[:, 1]])
+    if not np.isfinite(margin_percent) or margin_percent < 0:
+        raise ValueError("The extra distance margin must be finite and nonnegative.")
+    thresholds = MINIMUM_CONTACT_DISTANCES.copy()
+    for pair, value in (minimum_distances or {}).items():
+        if len(pair) != 2 or not np.isfinite(value) or value <= 0:
+            raise ValueError("Minimum pair distances must be finite and positive.")
+        thresholds[tuple(sorted(pair))] = float(value)
+    symbols = atoms.get_chemical_symbols()
+    radii = covalent_radii[atoms.numbers]
+    viewer_cutoffs = 1.09 * (radii[pairs[:, 0]] + radii[pairs[:, 1]])
+    floors = np.array(
+        [
+            thresholds.get(
+                tuple(sorted((symbols[first], symbols[second]))), cutoff + 0.05
+            )
+            for (first, second), cutoff in zip(pairs, viewer_cutoffs)
+        ]
+    ) * (1 + margin_percent / 100)
+    if np.any(floors <= viewer_cutoffs + 1e-4):
+        raise ValueError(
+            "Minimum distances must exceed the viewer's bond cutoffs; increase the pair distances or extra margin."
+        )
+    return floors
 
 
 @dataclass
@@ -25,21 +60,26 @@ class StericResult:
     remaining_contacts: int
     torsions: list[tuple[int, int, float]]
     note: str = ""
+    mode: str = "steric"
 
     @property
     def message(self) -> str:
         if self.note:
             return self.note
+        name = "3D torsion relief" if self.mode == "steric" else "Minimal 3D torsion"
+        contact = (
+            "steric contacts" if self.mode == "steric" else "short nonbonded contacts"
+        )
         if not self.initial_contacts:
-            return "No steric contacts need 3D relief."
+            return f"{name}: no distances below the selected thresholds."
         angles = ", ".join(f"{abs(angle):.1f}°" for _, _, angle in self.torsions)
         status = (
-            f"{self.remaining_contacts} steric contacts remain; inspect the model."
+            f"{self.remaining_contacts} {contact} remain; inspect the model."
             if self.remaining_contacts
-            else "Steric contact limits satisfied."
+            else "Selected distance thresholds satisfied."
         )
         return (
-            f"3D torsion relief: {self.initial_contacts} → "
+            f"{name}: {self.initial_contacts} → "
             f"{self.remaining_contacts} contacts. {status} "
             f"Rotations: {angles or 'none'}. Starting conformer; not energy optimized."
         )
@@ -133,6 +173,10 @@ def relieve_steric_contacts(
     bonds: list[tuple[int, int, float]],
     contact_scale: float = 0.75,
     resolve: bool = True,
+    *,
+    mode: str = "steric",
+    minimum_distances: dict[tuple[str, str], float] | None = None,
+    margin_percent: float = 0.0,
 ) -> StericResult:
     """Find small bridge torsions while retaining every atom and explicit bond.
 
@@ -147,8 +191,17 @@ def relieve_steric_contacts(
     Unsupported chemistry and contacts within a rigid block are reported, never
     corrected by bending rings, inventing bonds, or deleting hydrogens.
     Set resolve=False to inspect the same contact criteria without moving atoms.
+
+    Minimal mode uses C-C/C-H/H-H floors of 1.70/1.30/0.80 angstrom, plus an
+    optional percentage margin. Other pairs use the viewer's covalent cutoff
+    plus 0.05 angstrom. Unlike steric mode it checks every nonbonded pair,
+    including 1-3 pairs, so unresolved geometric bonds cannot be hidden by the
+    angle exclusion. Pair floors are editable, but must exceed viewer cutoffs.
+    This mode may leave substantial van der Waals overlap; relax before use.
     """
-    result = StericResult(atoms.copy(), 0, 0, [])
+    if mode not in {"steric", "minimal"}:
+        raise ValueError("3D mode must be 'steric' or 'minimal'.")
+    result = StericResult(atoms.copy(), 0, 0, [], mode=mode)
     if np.any(atoms.pbc):
         result.note = "3D torsion relief supports finite molecules only."
         return result
@@ -169,13 +222,14 @@ def relieve_steric_contacts(
         for first in range(len(atoms))
         for second in range(first + 1, len(atoms))
         if second not in adjacency[first]
-        and not adjacency[first].intersection(adjacency[second])
+        and (mode == "minimal" or not adjacency[first].intersection(adjacency[second]))
     ]
     if not pairs:
         return result
     pairs = np.asarray(pairs)
-    radii = vdw_radii[atoms.numbers]
-    floors = contact_scale * (radii[pairs[:, 0]] + radii[pairs[:, 1]])
+    floors = _contact_floors(
+        atoms, pairs, mode, contact_scale, minimum_distances, margin_percent
+    )
 
     def distances(positions):
         return np.linalg.norm(positions[pairs[:, 0]] - positions[pairs[:, 1]], axis=1)
@@ -189,7 +243,7 @@ def relieve_steric_contacts(
         return result
     if not resolve:
         result.note = (
-            f"{result.initial_contacts} close nonbonded contacts in the planar "
+            f"{result.initial_contacts} close nonbonded contacts in the "
             "starting geometry. All hydrogens retained; enable 3D steric relief "
             "or inspect the model."
         )
@@ -197,7 +251,7 @@ def relieve_steric_contacts(
     rotations = _torsions(atoms, bonds, adjacency)
     if not rotations or len(rotations) > 12:
         result.note = (
-            f"{result.initial_contacts} steric contacts remain; no supported small "
+            f"{result.initial_contacts} distances remain below thresholds; no supported small "
             "torsion search is available. All atoms retained; inspect the model."
         )
         return result
@@ -209,7 +263,7 @@ def relieve_steric_contacts(
             & ~np.isin(pairs[:, 1], (first, second))
         )
     if not np.any(movable):
-        result.note = f"{result.initial_contacts} steric contacts lie within rigid blocks; all atoms retained."
+        result.note = f"{result.initial_contacts} short contacts lie within rigid blocks; all atoms retained."
         return result
     lower = -np.asarray([rotation[3] for rotation in rotations])
     upper = -lower

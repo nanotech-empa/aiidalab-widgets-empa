@@ -6,9 +6,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 from ase import Atoms
+from ase.neighborlist import natural_cutoffs, neighbor_list
 
 from aiidalab_widgets_empa import CdxmlUploadWidget
-from aiidalab_widgets_empa.cdxml_sterics import relieve_steric_contacts
+from aiidalab_widgets_empa.cdxml_sterics import (
+    MINIMUM_CONTACT_DISTANCES,
+    relieve_steric_contacts,
+)
 
 
 def crowded_biaryl(scale=1.0):
@@ -201,3 +205,120 @@ def test_encoded_stereochemistry_skips_generic_torsion_search(attribute, value):
     assert "encodes stereochemistry" in widget.output_message.value
     assert widget.structure.get_chemical_formula() == "C14H14"
     assert np.ptp(widget.structure.positions[:14, 2]) < 1e-9
+
+
+def test_minimal_mode_twists_less_and_has_no_extra_viewer_bonds():
+    _, _, original = CdxmlUploadWidget.cdxml_to_ase_from_string(crowded_biaryl())
+    bonds = original.info["_cdxml_bonds"]
+    steric = relieve_steric_contacts(original, bonds)
+    minimal = relieve_steric_contacts(original, bonds, mode="minimal")
+    assert minimal.remaining_contacts == 0
+    assert minimal.atoms.get_chemical_formula() == "C14H14"
+
+    # Compare only block torsions: a methyl has a terminal heavy carbon.
+    def block_cost(result):
+        return sum(
+            angle**2
+            for first, second, angle in result.torsions
+            if first < 12 and second < 12
+        )
+
+    assert block_cost(minimal) < block_cost(steric)
+    assert np.allclose(
+        bond_lengths(original, bonds), bond_lengths(minimal.atoms, bonds)
+    )
+    assert np.allclose(
+        local_cosines(original, bonds), local_cosines(minimal.atoms, bonds)
+    )
+    first, second = neighbor_list(
+        "ij", minimal.atoms, natural_cutoffs(minimal.atoms, mult=1.09)
+    )
+    perceived = {frozenset((i, j)) for i, j in zip(first, second)}
+    explicit = {frozenset((i, j)) for i, j, _ in bonds}
+    assert not perceived - explicit
+
+
+@pytest.mark.parametrize("margin", [0, 10])
+def test_minimal_pair_overrides_and_percentage_margin_are_respected(margin):
+    _, _, atoms = CdxmlUploadWidget.cdxml_to_ase_from_string(crowded_biaryl())
+    bonds = atoms.info["_cdxml_bonds"]
+    overrides = {("C", "C"): 1.8, ("H", "C"): 1.4}
+    result = relieve_steric_contacts(
+        atoms, bonds, mode="minimal", minimum_distances=overrides, margin_percent=margin
+    )
+    assert result.remaining_contacts == 0
+    explicit = {frozenset((i, j)) for i, j, _ in bonds}
+    thresholds = {**MINIMUM_CONTACT_DISTANCES, ("C", "C"): 1.8, ("C", "H"): 1.4}
+    for first in range(len(atoms)):
+        for second in range(first + 1, len(atoms)):
+            if frozenset((first, second)) in explicit:
+                continue
+            pair = tuple(sorted((atoms[first].symbol, atoms[second].symbol)))
+            floor = thresholds[pair] * (1 + margin / 100)
+            assert result.atoms.get_distance(first, second) >= floor - 1e-4
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"minimum_distances": {("C", "C"): 1.60}},
+        {"minimum_distances": {("C", "H"): float("nan")}},
+        {"margin_percent": -1},
+        {"mode": "unknown"},
+    ],
+)
+def test_minimal_mode_rejects_invalid_or_viewer_bond_distance_settings(kwargs):
+    _, _, atoms = CdxmlUploadWidget.cdxml_to_ase_from_string(crowded_biaryl())
+    with pytest.raises(ValueError):
+        relieve_steric_contacts(
+            atoms, atoms.info["_cdxml_bonds"], **{"mode": "minimal", **kwargs}
+        )
+
+
+def test_minimal_mode_reports_an_unfixable_1_3_contact():
+    atoms = Atoms("CH2", positions=[[0, 0, 0], [1.1, 0, 0], [1.1, 0.2, 0]])
+    bonds = [(0, 1, 1), (0, 2, 1)]
+    assert relieve_steric_contacts(atoms, bonds).initial_contacts == 0
+    result = relieve_steric_contacts(atoms, bonds, mode="minimal")
+    assert result.initial_contacts == result.remaining_contacts == 1
+    assert np.array_equal(result.atoms.positions, atoms.positions)
+    assert "All atoms retained" in result.message
+
+
+def test_minimal_widget_controls_invalidate_the_model_and_preserve_preview():
+    widget = CdxmlUploadWidget()
+    upload(widget, crowded_biaryl())
+    original_png = bytes(widget.png_preview.value)
+    widget.resolve_steric_collisions.value = True
+    assert widget.steric_mode.value == "steric"
+    assert widget.minimum_contacts_box.layout.display == "none"
+    widget.steric_mode.value = "minimal"
+    assert widget.minimum_contacts_box.layout.display == ""
+    widget.create_button.click()
+    assert "Minimal 3D torsion" in widget.output_message.value
+    widget.steric_margin_percent.value = 10
+    assert widget.structure is None
+    widget.create_button.click()
+    assert widget.structure.get_chemical_formula() == "C14H14"
+    widget.minimum_contact_distances[("C", "C")].value = 1.8
+    assert widget.structure is None
+    widget.create_button.click()
+    assert widget.structure.get_chemical_formula() == "C14H14"
+    assert bytes(widget.png_preview.value) == original_png
+    widget.resolve_steric_collisions.value = False
+    assert widget.structure is None
+    assert widget.steric_controls.layout.display == "none"
+    widget.create_button.click()
+    assert np.ptp(widget.structure.positions[:14, 2]) < 1e-9
+
+
+def test_minimal_controls_are_hidden_for_periodic_models():
+    widget = CdxmlUploadWidget()
+    upload(widget, crowded_biaryl())
+    widget.resolve_steric_collisions.value = True
+    widget.steric_mode.value = "minimal"
+    upload(widget, (Path(__file__).parent / "7AGNR.cdxml").read_bytes())
+    assert widget.resolve_steric_collisions.disabled
+    assert widget.steric_controls.layout.display == "none"
+    widget.create_button.click()
+    assert widget.structure.get_chemical_formula() == "C14H4"

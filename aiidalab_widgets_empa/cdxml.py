@@ -16,7 +16,7 @@ from ase.neighborlist import NeighborList
 from scipy.optimize import least_squares, linear_sum_assignment
 
 from .cdxml_rendering import render_cdxml_png, set_png_widget
-from .cdxml_sterics import relieve_steric_contacts
+from .cdxml_sterics import MINIMUM_CONTACT_DISTANCES, relieve_steric_contacts
 
 
 # ---------------- Utility functions ----------------
@@ -334,6 +334,58 @@ class CdxmlUploadWidget(ipw.VBox):
         self.resolve_steric_collisions.observe(
             self._on_steric_option_change, names="value"
         )
+        self.steric_mode = ipw.Dropdown(
+            description="3D method",
+            options=[
+                ("Steric separation", "steric"),
+                ("Minimal 3D torsion", "minimal"),
+            ],
+            value="steric",
+            layout={"width": "auto"},
+        )
+        self.minimum_contact_distances = {}
+        for pair, distance in MINIMUM_CONTACT_DISTANCES.items():
+            cutoff = 1.09 * sum(
+                covalent_radii[6 if symbol == "C" else 1] for symbol in pair
+            )
+            field = ipw.BoundedFloatText(
+                description=f"{'–'.join(pair)} (Å)",
+                value=distance,
+                min=math.ceil((cutoff + 0.001) * 100) / 100,
+                max=10.0,
+                step=0.01,
+                layout={"width": "190px"},
+            )
+            field.observe(self._on_steric_option_change, names="value")
+            self.minimum_contact_distances[pair] = field
+        self.steric_margin_percent = ipw.BoundedFloatText(
+            description="Extra margin (%)",
+            value=0.0,
+            min=0.0,
+            max=100.0,
+            step=1.0,
+            style={"description_width": "initial"},
+            layout={"width": "240px"},
+        )
+        self.steric_margin_percent.observe(self._on_steric_option_change, names="value")
+        self.steric_mode.observe(self._on_steric_option_change, names="value")
+        self.minimum_contacts_box = ipw.VBox(
+            [
+                ipw.HTML(
+                    "Minimum nonbonded distances; the extra margin scales all of them."
+                ),
+                ipw.HBox(
+                    list(self.minimum_contact_distances.values()),
+                    layout={"flex_flow": "row wrap"},
+                ),
+                self.steric_margin_percent,
+            ],
+            layout={"display": "none"},
+        )
+        self.steric_controls = ipw.VBox(
+            [self.steric_mode, self.minimum_contacts_box],
+            layout={"display": "none"},
+        )
         self.use_clever_hydrogenation.observe(
             self._on_hydrogenation_option_change, names="value"
         )
@@ -367,6 +419,7 @@ class CdxmlUploadWidget(ipw.VBox):
                 self.use_clever_hydrogenation,
                 self.symmetrize_geometry,
                 self.resolve_steric_collisions,
+                self.steric_controls,
                 self.steric_help,
                 supported_formats,
                 self.create_button,
@@ -791,9 +844,27 @@ class CdxmlUploadWidget(ipw.VBox):
         self.steric_help.layout.display = (
             "none" if self.resolve_steric_collisions.disabled else ""
         )
+        active = (
+            not self.resolve_steric_collisions.disabled
+            and self.resolve_steric_collisions.value
+        )
+        self.steric_controls.layout.display = "" if active else "none"
+        self.minimum_contacts_box.layout.display = (
+            "" if active and self.steric_mode.value == "minimal" else "none"
+        )
+        self.steric_help.value = (
+            "Minimal 3D torsion keeps nonbonded atoms beyond the selected distances. "
+            "It can leave van der Waals overlaps; relax this starting conformer. "
+            "The sketch stays 2D and rings remain rigid."
+            if active and self.steric_mode.value == "minimal"
+            else "Finite C/H/halogen molecules: rotate connected aromatic blocks and "
+            "methyl hydrogens. Steric separation uses 75% of summed van der Waals "
+            "radii. The sketch stays 2D; no energy optimization."
+        )
 
     def _on_steric_option_change(self, _=None) -> None:
         self.structure = None
+        self._update_steric_option()
 
     def _on_hydrogenation_option_change(self, _=None) -> None:
         self.structure = None
@@ -947,7 +1018,22 @@ class CdxmlUploadWidget(ipw.VBox):
                         "all atoms retained. Inspect the model."
                     )
                 else:
-                    result = relieve_steric_contacts(atoms, bonds, resolve=resolve)
+                    try:
+                        result = relieve_steric_contacts(
+                            atoms,
+                            bonds,
+                            resolve=resolve,
+                            mode=self.steric_mode.value if resolve else "steric",
+                            minimum_distances={
+                                pair: field.value
+                                for pair, field in self.minimum_contact_distances.items()
+                            },
+                            margin_percent=self.steric_margin_percent.value,
+                        )
+                    except ValueError as exc:
+                        self.structure = None
+                        self.output_message.value = f"Error: {html.escape(str(exc))}"
+                        return
                     atoms = result.atoms
                     if resolve or result.initial_contacts:
                         steric_message = result.message

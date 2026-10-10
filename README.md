@@ -17,3 +17,12 @@ Unresolved contacts are reported and atoms are never deleted to clear them.
 The option currently supports finite C/H/halogen molecules without encoded
 stereochemistry, with at most twelve supported rotatable connections. Periodic
 models continue to use the existing planar importer.
+
+The **3D method** selector offers **Steric separation** (the default above) or
+**Minimal 3D torsion**, which uses editable minimum nonbonded distances of
+1.70 Å for C-C, 1.30 Å for C-H and 0.80 Å for H-H. **Extra margin (%)** scales
+these distance floors; it starts at zero. Other element pairs use the viewer's
+covalent cutoff plus 0.05 Å. Minimal mode checks all nonbonded pairs, including
+1-3 pairs, and requires thresholds above the viewer's bond cutoffs. This mode
+reduces twisting but can leave van der Waals overlaps: relax the starting model
+before a physical calculation. Both methods use the same rigid-block search.
