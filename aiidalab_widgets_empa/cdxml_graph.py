@@ -142,6 +142,7 @@ class CdxmlGraph:
     atoms: tuple[CdxmlAtom, ...]
     bonds: tuple[CdxmlBond, ...]
     stereochemistry: bool
+    annotation_warnings: tuple[str, ...] = ()
 
     @property
     def index(self) -> dict[str, int]:
@@ -299,12 +300,54 @@ def read_cdxml_graph(content: str | bytes) -> CdxmlGraph:
         if kind in {"a", "aromatic"}:
             kind = "1.5"
         bonds.append(CdxmlBond(identifier, first, second, kind))
-    stereochemistry = any(
+    drawn_stereo = any(
         any(
             word in bond.get("Display", "").lower()
             for word in ("wedge", "hash", "wavy")
         )
         or bond.get("BS", "U").upper() not in {"", "N", "U"}
         for bond in root.iter("b")
-    ) or any(node.get("AS", "U").upper() not in {"", "N", "U"} for node in nodes)
-    return CdxmlGraph(tuple(atoms), tuple(bonds), stereochemistry)
+    )
+    annotations = [node for node in nodes if node.get("AS", "U") not in {"", "N", "U"}]
+    graph = CdxmlGraph(tuple(atoms), tuple(bonds), drawn_stereo or bool(annotations))
+    warnings = []
+    meaningful_atom_stereo = False
+    if annotations:
+        molecule = graph.rdkit_molecule()
+        potential = tuple(Chem.FindPotentialStereo(molecule))
+        centres = {
+            item.centeredOn for item in potential if str(item.type).startswith("Atom_")
+        }
+        has_axial = any("Atrop" in str(item.type) for item in potential)
+        for node in annotations:
+            index = graph.index[node.get("id")]
+            atom = molecule.GetAtomWithIdx(index)
+            if node.get("AS") == "u":
+                warnings.append(
+                    f"Unspecified AS='u' on atom {node.get('id')}: no absolute configuration given; original annotation retained"
+                )
+                continue
+            # ChemDraw can retain computed CIP metadata after a drawing change.
+            # Neither 'a' nor unspecified 'u' makes a neutral aromatic carbon a
+            # tetrahedral centre. Preserve the annotation and report it instead
+            # of rejecting an otherwise ordinary planar aromatic graph.
+            aromatic_annotation = (
+                node.get("AS") in {"a", "u"}
+                and atom.GetAtomicNum() == 6
+                and atom.GetIsAromatic()
+                and index not in centres
+                and not has_axial
+                and not atom.GetFormalCharge()
+                and not atom.GetNumRadicalElectrons()
+            )
+            if aromatic_annotation:
+                warnings.append(
+                    f"AS={node.get('AS')!r} on atom {node.get('id')}: RDKit finds no stereogenic carbon centre; original annotation retained"
+                )
+            else:
+                meaningful_atom_stereo = True
+    return replace(
+        graph,
+        stereochemistry=drawn_stereo or meaningful_atom_stereo,
+        annotation_warnings=tuple(warnings),
+    )

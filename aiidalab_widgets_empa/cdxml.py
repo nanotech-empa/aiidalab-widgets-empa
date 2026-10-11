@@ -2166,6 +2166,16 @@ class CdxmlUploadWidget(ipw.VBox):
             bare_mol.info["cdxml_source"]["coordination_interpretations"] = coordination
         if graph.stereochemistry:
             geometry_message += " Warning: encoded stereochemistry is retained in the source drawing but is not reconstructed in this starting model."
+        if graph.annotation_warnings:
+            geometry_message += (
+                " Warning: " + "; ".join(graph.annotation_warnings) + "."
+            )
+            mol.info["cdxml_source"]["annotation_warnings"] = list(
+                graph.annotation_warnings
+            )
+            bare_mol.info["cdxml_source"]["annotation_warnings"] = list(
+                graph.annotation_warnings
+            )
         msg = geometry_message
         return msg, bare_mol, mol
 

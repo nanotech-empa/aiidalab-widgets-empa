@@ -39,6 +39,9 @@ the original source types and declared H remain available. Review this assumptio
 Abbreviations must currently be expanded into
 explicit element atoms in ChemDraw. Encoded stereochemistry is reported but
 is not reconstructed into a stereospecific 3D model.
+Cached CIP annotations are preserved. Unspecified `AS=u` does not assign an
+absolute configuration; redundant annotations on a carbon which RDKit finds
+non-stereogenic are reported without blocking an ordinary planar sketch.
 
 Without C-C reference bonds, drawing scale is estimated from covalent radii,
 not interpreted as angstrom units. This supplies a starting geometry, not

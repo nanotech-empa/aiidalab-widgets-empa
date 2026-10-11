@@ -402,3 +402,53 @@ def test_preview_labels_an_isotope_and_declared_heteroatom_H(monkeypatch):
     )
     assert "13C" in labels
     assert "NH3+" in labels
+
+
+@pytest.mark.parametrize("annotation", ["a", "u"])
+def test_non_stereogenic_aromatic_annotation_is_reported_and_does_not_block_cleanup(
+    annotation,
+):
+    nodes = [
+        (
+            6,
+            (30 * np.cos(i * np.pi / 3), 30 * np.sin(i * np.pi / 3)),
+            {"AS": annotation} if i == 0 else {},
+        )
+        for i in range(6)
+    ]
+    content = drawing(
+        nodes, [(i, (i + 1) % 6, 2 if i % 2 == 0 else 1) for i in range(6)]
+    )
+    graph = read_cdxml_graph(content)
+    assert not graph.stereochemistry
+    assert graph.annotation_warnings
+    message, _, _ = CdxmlUploadWidget.cdxml_to_ase_from_string(content, symmetrize=True)
+    assert "cleaned globally" in message
+    assert "annotation retained" in message
+
+
+def test_lowercase_unspecified_atom_stereo_is_distinct_from_undetermined_uppercase_U():
+    nodes = [
+        (6, (0, 0), {"AS": "u"}),
+        (9, (30, 0), {}),
+        (17, (0, 30), {}),
+        (35, (-30, 0), {}),
+    ]
+    content = drawing(nodes, [(0, 1, 1), (0, 2, 1), (0, 3, 1)])
+    graph = read_cdxml_graph(content)
+    assert not graph.stereochemistry
+    assert graph.annotation_warnings
+    root = ET.fromstring(content)
+    root.find(".//n").set("AS", "U")
+    assert not read_cdxml_graph(ET.tostring(root)).stereochemistry
+    assert not read_cdxml_graph(ET.tostring(root)).annotation_warnings
+
+
+def test_unspecified_stereo_on_CH2_does_not_create_a_false_stereocentre():
+    content = drawing(
+        [(6, (-30, 0), {}), (6, (0, 0), {"AS": "u"}), (6, (30, 0), {})],
+        [(0, 1, 1), (1, 2, 1)],
+    )
+    graph = read_cdxml_graph(content)
+    assert not graph.stereochemistry
+    assert graph.annotation_warnings
