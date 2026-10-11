@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from ase.data import chemical_symbols
 from rdkit import Chem
@@ -81,6 +81,27 @@ def _integer(value: str, name: str, atom_id: str) -> int:
         raise ValueError(f"Atom {atom_id} has invalid {name}: {value!r}.") from exc
 
 
+def radical_electrons(root, node) -> int:
+    """Read a chemical radical attribute or associated electron graphics."""
+    identifier = node.get("id")
+    radical = node.get("Radical", "").lower()
+    if radical not in _RADICAL_ELECTRONS:
+        raise ValueError(f"Atom {identifier} has unsupported radical {radical!r}.")
+    declared = _RADICAL_ELECTRONS[radical]
+    if declared:
+        return declared
+    return sum(
+        graphic.get("SymbolType") == "Electron"
+        and any(
+            rep.get("object") == identifier
+            for rep in graphic.iter()
+            if rep.tag.rsplit("}", 1)[-1] == "represent"
+        )
+        for graphic in root.iter()
+        if graphic.tag.rsplit("}", 1)[-1] == "graphic"
+    )
+
+
 @dataclass(frozen=True)
 class CdxmlAtom:
     """An actual element node; labels and external connection points are not atoms."""
@@ -126,6 +147,34 @@ class CdxmlGraph:
     def index(self) -> dict[str, int]:
         return {atom.id: index for index, atom in enumerate(self.atoms)}
 
+    def chemistry_bonds(self) -> tuple[CdxmlBond, ...]:
+        """Interpret N/O-metal single lines as coordination, retaining the source."""
+        atoms = {atom.id: atom for atom in self.atoms}
+        bonds = []
+        for bond in self.bonds:
+            first, second = atoms[bond.begin], atoms[bond.end]
+            if (
+                bond.type == "1"
+                and first.number in {7, 8}
+                and second.number not in _NONMETALS
+            ):
+                bond = replace(bond, type="dative")
+            elif (
+                bond.type == "1"
+                and second.number in {7, 8}
+                and first.number not in _NONMETALS
+            ):
+                bond = replace(bond, begin=second.id, end=first.id, type="dative")
+            bonds.append(bond)
+        return tuple(bonds)
+
+    def coordination_interpretations(self) -> list[dict[str, str]]:
+        return [
+            {"bond_id": source.id, "donor": interpreted.begin, "metal": interpreted.end}
+            for source, interpreted in zip(self.bonds, self.chemistry_bonds())
+            if source.type != interpreted.type
+        ]
+
     def rdkit_molecule(self):
         """Build a chemistry model without rewriting the source bond types."""
         molecule = Chem.RWMol()
@@ -141,7 +190,7 @@ class CdxmlGraph:
                 atom.SetNoImplicit(True)
             molecule.AddAtom(atom)
         indices = self.index
-        for spec in self.bonds:
+        for spec in self.chemistry_bonds():
             bond_type = _BOND_TYPES[spec.type]
             first, second = indices[spec.begin], indices[spec.end]
             molecule.AddBond(first, second, bond_type)
@@ -149,8 +198,8 @@ class CdxmlGraph:
                 molecule.GetAtomWithIdx(first).SetIsAromatic(True)
                 molecule.GetAtomWithIdx(second).SetIsAromatic(True)
         molecule = molecule.GetMol()
-        # In particular do not silently replace metal single bonds with datives,
-        # or rewrite a charged/overvalent drawing into a different Lewis structure.
+        # Apply only the documented N/O-metal interpretation above; do not let
+        # sanitization silently rewrite charges or other source bond types.
         operations = Chem.SanitizeFlags.SANITIZE_ALL
         operations ^= Chem.SanitizeFlags.SANITIZE_CLEANUP
         operations &= ~getattr(
@@ -216,18 +265,7 @@ def read_cdxml_graph(content: str | bytes) -> CdxmlGraph:
         )
         if isotope < 0 or hydrogens is not None and hydrogens < 0:
             raise ValueError(f"Atom {identifier} has a negative isotope or H count.")
-        radical = node.get("Radical", "").lower()
-        if radical not in _RADICAL_ELECTRONS:
-            raise ValueError(f"Atom {identifier} has unsupported radical {radical!r}.")
-        electrons = _RADICAL_ELECTRONS[radical]
-        if not electrons and any(
-            graphic.get("SymbolType") == "Electron"
-            and any(
-                rep.get("object") == identifier for rep in graphic.iter("represent")
-            )
-            for graphic in root.iter("graphic")
-        ):
-            electrons = 1
+        electrons = radical_electrons(root, node)
         atoms.append(
             CdxmlAtom(
                 identifier, number, (x, y, 0.0), charge, isotope, hydrogens, electrons
@@ -266,7 +304,7 @@ def read_cdxml_graph(content: str | bytes) -> CdxmlGraph:
             word in bond.get("Display", "").lower()
             for word in ("wedge", "hash", "wavy")
         )
-        or bond.get("BS", "U") not in {"", "N", "U"}
+        or bond.get("BS", "U").upper() not in {"", "N", "U"}
         for bond in root.iter("b")
-    ) or any(node.get("AS", "U") not in {"", "N", "U"} for node in nodes)
+    ) or any(node.get("AS", "U").upper() not in {"", "N", "U"} for node in nodes)
     return CdxmlGraph(tuple(atoms), tuple(bonds), stereochemistry)

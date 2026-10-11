@@ -17,7 +17,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from matplotlib.patches import Circle, FancyArrowPatch
 
-from .cdxml_graph import _RADICAL_ELECTRONS
+from .cdxml_graph import radical_electrons
 
 
 def _elements(root, name):
@@ -86,7 +86,14 @@ def _bond_segments(first, second, order, position, spacing):
     return [(first + left * offset, second + left * offset) for offset in offsets]
 
 
-def render_cdxml_png(content: bytes | str, *, highlighted_bonds=(), max_pixels=1200):
+def render_cdxml_png(
+    content: bytes | str,
+    *,
+    highlighted_bonds=(),
+    max_pixels=1200,
+    atom_indices=None,
+    return_layout=False,
+):
     """Draw a selected CDXML fragment as a proportionate PNG on white.
 
     Explicit DoublePosition overrides win; ring doubles without an override
@@ -286,7 +293,7 @@ def render_cdxml_png(content: bytes | str, *, highlighted_bonds=(), max_pixels=1
                 zorder=3,
                 bbox={"facecolor": "white", "edgecolor": "none", "pad": 0.2},
             )
-        electron_count = _RADICAL_ELECTRONS.get(node.get("Radical", "").lower(), 0)
+        electron_count = radical_electrons(root, node)
         if electron_count:
             radius = 0.035 * bond_length
             for dot in range(electron_count):
@@ -310,6 +317,17 @@ def render_cdxml_png(content: bytes | str, *, highlighted_bonds=(), max_pixels=1
                 axis.plot(
                     *point, marker="o", markersize=stroke * 2, color="#151515", zorder=4
                 )
+    for identifier, index in (atom_indices or {}).items():
+        if identifier in positions:
+            point = positions[identifier] + np.array([0.12, 0.18]) * bond_length
+            axis.text(
+                *point,
+                str(index),
+                fontsize=font_size * 0.55,
+                color="#135d9e",
+                zorder=5,
+                bbox={"facecolor": "white", "edgecolor": "none", "pad": 0.1},
+            )
 
     centres = [(first + second) / 2 for first, second in brackets]
     for index, (first, second) in enumerate(brackets):
@@ -333,7 +351,16 @@ def render_cdxml_png(content: bytes | str, *, highlighted_bonds=(), max_pixels=1
     buffer = BytesIO()
     figure.savefig(buffer, format="png", dpi=dpi, facecolor="white")
     figure.clear()
-    return buffer.getvalue()
+    png = buffer.getvalue()
+    if return_layout:
+        return png, {
+            "low": low.tolist(),
+            "high": high.tolist(),
+            "positions": {
+                identifier: point.tolist() for identifier, point in positions.items()
+            },
+        }
+    return png
 
 
 def set_png_widget(image_widget, content: bytes, *, max_side=300):

@@ -87,6 +87,28 @@ def test_dative_direction_and_hydrogen_ownership_are_preserved():
     assert atoms.info["cdxml_source"]["formal_charge"] == 2
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_single_N_metal_line_is_interpreted_with_a_visible_warning(reverse):
+    content = drawing(
+        [
+            (6, (-30, 0), {}),
+            (7, (0, 0), {"NumHydrogens": 2}),
+            (30, (30, 0), {"Charge": 2}),
+        ],
+        [(0, 1, 1), (2, 1, 1) if reverse else (1, 2, 1)],
+    )
+    message, _, atoms = CdxmlUploadWidget.cdxml_to_ase_from_string(content)
+    assert atoms.get_chemical_formula() == "CH5NZn"
+    assert "single N/O-metal bonds interpreted as coordination" in message
+    source = atoms.info["cdxml_source"]
+    assert source["bonds"][1]["type"] == "1"
+    assert source["coordination_interpretations"][0] == {
+        "bond_id": "b1",
+        "donor": "1",
+        "metal": "2",
+    }
+
+
 @pytest.mark.parametrize("symbol", ["Fe", "Co", "Zn"])
 def test_synthetic_metal_porphine(symbol):
     smiles = (
@@ -213,6 +235,37 @@ def test_collinear_CH2_does_not_generate_H_on_the_carbon():
         assert atoms.get_distance(first, second) > 1.0
 
 
+def test_water_and_hydroxyl_have_non_degenerate_hydrogen_angles():
+    water = convert(drawing([(8, (0, 0), {})]))
+    assert water.get_angle(1, 0, 2) == pytest.approx(104.5)
+    alcohol = convert(drawing([(6, (0, 0), {}), (8, (30, 0), {})], [(0, 1, 1)]))
+    oxygen_hydrogen = next(
+        hydrogen
+        for parent, hydrogen, _ in alcohol.info["_cdxml_bonds"]
+        if parent == 1 and alcohol[hydrogen].symbol == "H"
+    )
+    assert alcohol.get_angle(0, 1, oxygen_hydrogen) == pytest.approx(105)
+
+
+def test_cleanup_moves_an_explicit_NH_group_together():
+    positions = np.array(
+        [
+            [0.0, 0, 0],
+            [1.43, 0, 0],
+            [2.1, 1.25, 0],
+            [3.53, 1.25, 0],
+            [2.1, 2.25, 0],
+            [2.1, 3.25, 0],
+        ]
+    )
+    cleaned = CdxmlUploadWidget.symmetrize_carbon_network(
+        positions,
+        ["C", "C", "C", "C", "N", "H"],
+        [(0, 1), (1, 2), (2, 3), (2, 4), (4, 5)],
+    )
+    assert np.allclose(cleaned[5] - cleaned[4], positions[5] - positions[4])
+
+
 def test_isotope_mass_and_source_survive_extended_xyz():
     atoms = convert(
         drawing([(6, (0, 0), {"Isotope": 13}), (6, (30, 0), {})], [(0, 1, 1)])
@@ -296,4 +349,26 @@ def test_preview_radical_symbols_match_the_chemical_electron_count(
 
     monkeypatch.setattr(cdxml_rendering, "Circle", record)
     cdxml_rendering.render_cdxml_png(drawing([(6, (0, 0), {"Radical": radical})]))
+    assert len(dots) == count
+
+
+@pytest.mark.parametrize("count", [1, 2])
+def test_associated_electron_graphics_control_both_hydrogens_and_preview(
+    monkeypatch, count
+):
+    root = ET.fromstring(drawing([(6, (0, 0), {})]))
+    for _ in range(count):
+        graphic = ET.SubElement(root, "graphic", SymbolType="Electron")
+        ET.SubElement(graphic, "represent", object="0")
+    content = ET.tostring(root)
+    assert convert(content).get_chemical_formula() == f"CH{4 - count}"
+    dots = []
+    original = cdxml_rendering.Circle
+
+    def record(*args, **kwargs):
+        dots.append(args[0])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(cdxml_rendering, "Circle", record)
+    cdxml_rendering.render_cdxml_png(content)
     assert len(dots) == count

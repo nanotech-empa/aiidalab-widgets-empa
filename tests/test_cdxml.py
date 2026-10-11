@@ -51,7 +51,7 @@ def test_structure_upload_widget():
     widget.nunits.value = "2"
     widget.create_button.click()
     assert isinstance(widget.structure, ase.Atoms)
-    assert widget.structure.get_chemical_formula() == "C56H22"
+    assert widget.structure.get_chemical_formula() == "C56H24"
 
     # case of benzene molecule
     filename = Path(__file__).parent / "benzene.cdxml"
@@ -124,7 +124,8 @@ def test_periodic_crossings_are_independent_of_bracket_order():
     assert not is_not_periodic
     assert crossing_points.shape == (2, 3)
     assert np.linalg.norm(crossing_points[1] - crossing_points[0]) == pytest.approx(
-        42.75, abs=0.05
+        42.0525,
+        abs=0.05,  # Mean of all equivalent-site translations, not one crossing.
     )
 
 
