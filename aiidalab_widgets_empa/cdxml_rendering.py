@@ -194,7 +194,7 @@ def render_cdxml_png(
         if bond.get("id") in highlighted:
             line(first, second, color="#d88413", style="--", linewidth=stroke * 1.3)
             continue
-        if bond.get("Order", "").lower() == "dative":
+        if bond.get("Order", "").strip().lower() == "dative":
             axis.add_patch(
                 FancyArrowPatch(
                     first,
@@ -209,10 +209,11 @@ def render_cdxml_png(
                 )
             )
             continue
-        try:
-            order = 1.5 if bond.get("Order") == "A" else float(bond.get("Order", "1"))
-        except ValueError:
-            order = 1.0
+        kind = bond.get("Order", "1").strip().lower()
+        orders = {"1": 1.0, "2": 2.0, "3": 3.0, "1.5": 1.5, "a": 1.5, "aromatic": 1.5}
+        if kind not in orders:
+            raise ValueError(f"Cannot preview unsupported bond order {kind!r}.")
+        order = orders[kind]
         position = bond.get(
             "DoublePosition", auto_positions.get(bond.get("id"), "Center")
         )
@@ -276,8 +277,12 @@ def render_cdxml_png(
         atomic_number = int(node.get("Element", "6"))
         label = "".join(item.text or "" for item in _elements(node, "s"))
         charge = int(node.get("Charge", "0"))
-        if not label and (atomic_number != 6 or charge):
-            label = chemical_symbols[atomic_number]
+        isotope = int(node.get("Isotope", "0"))
+        if not label and (atomic_number != 6 or charge or isotope):
+            label = (str(isotope) if isotope else "") + chemical_symbols[atomic_number]
+            hydrogens = int(node.get("NumHydrogens", "0"))
+            if hydrogens:
+                label += "H" + (str(hydrogens) if hydrogens > 1 else "")
             if charge:
                 label += (str(abs(charge)) if abs(charge) > 1 else "") + (
                     "+" if charge > 0 else "−"

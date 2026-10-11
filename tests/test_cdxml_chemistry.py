@@ -372,3 +372,33 @@ def test_associated_electron_graphics_control_both_hydrogens_and_preview(
     monkeypatch.setattr(cdxml_rendering, "Circle", record)
     cdxml_rendering.render_cdxml_png(content)
     assert len(dots) == count
+
+
+def test_preview_does_not_turn_an_unknown_bond_into_a_single_line():
+    content = drawing([(6, (0, 0), {}), (6, (30, 0), {})], [(0, 1, "query")])
+    with pytest.raises(ValueError, match="unsupported bond order"):
+        cdxml_rendering.render_cdxml_png(content)
+
+
+def test_preview_labels_an_isotope_and_declared_heteroatom_H(monkeypatch):
+    from matplotlib.axes import Axes
+
+    labels = []
+    original = Axes.text
+
+    def record(self, x, y, text, *args, **kwargs):
+        labels.append(text)
+        return original(self, x, y, text, *args, **kwargs)
+
+    monkeypatch.setattr(Axes, "text", record)
+    cdxml_rendering.render_cdxml_png(
+        drawing(
+            [
+                (6, (0, 0), {"Isotope": 13}),
+                (7, (30, 0), {"NumHydrogens": 3, "Charge": 1}),
+            ],
+            [(0, 1, 1)],
+        )
+    )
+    assert "13C" in labels
+    assert "NH3+" in labels
