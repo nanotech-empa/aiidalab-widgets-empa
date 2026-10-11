@@ -15,7 +15,9 @@ import numpy as np
 from ase.data import chemical_symbols
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
-from matplotlib.patches import Circle
+from matplotlib.patches import Circle, FancyArrowPatch
+
+from .cdxml_graph import _RADICAL_ELECTRONS
 
 
 def _elements(root, name):
@@ -185,6 +187,21 @@ def render_cdxml_png(content: bytes | str, *, highlighted_bonds=(), max_pixels=1
         if bond.get("id") in highlighted:
             line(first, second, color="#d88413", style="--", linewidth=stroke * 1.3)
             continue
+        if bond.get("Order", "").lower() == "dative":
+            axis.add_patch(
+                FancyArrowPatch(
+                    first,
+                    second,
+                    arrowstyle="-|>",
+                    mutation_scale=max(5, font_size * 0.65),
+                    shrinkA=font_size * 0.45,
+                    shrinkB=font_size * 0.65,
+                    linewidth=stroke,
+                    color="#151515",
+                    zorder=1,
+                )
+            )
+            continue
         try:
             order = 1.5 if bond.get("Order") == "A" else float(bond.get("Order", "1"))
         except ValueError:
@@ -269,16 +286,18 @@ def render_cdxml_png(content: bytes | str, *, highlighted_bonds=(), max_pixels=1
                 zorder=3,
                 bbox={"facecolor": "white", "edgecolor": "none", "pad": 0.2},
             )
-        if node.get("Radical", "").lower() in ("doublet", "1"):
+        electron_count = _RADICAL_ELECTRONS.get(node.get("Radical", "").lower(), 0)
+        if electron_count:
             radius = 0.035 * bond_length
-            axis.add_patch(
-                Circle(
-                    position + np.array([0.16, -0.16]) * bond_length,
-                    radius,
-                    color="#151515",
-                    zorder=4,
+            for dot in range(electron_count):
+                axis.add_patch(
+                    Circle(
+                        position + np.array([0.16 + dot * 0.10, -0.16]) * bond_length,
+                        radius,
+                        color="#151515",
+                        zorder=4,
+                    )
                 )
-            )
     for graphic in graphics.values():
         if graphic.get("SymbolType", "").lower() != "electron":
             continue
@@ -286,7 +305,7 @@ def render_cdxml_png(content: bytes | str, *, highlighted_bonds=(), max_pixels=1
             identifier = representation.get("object")
             if identifier in positions and nodes[identifier].get(
                 "Radical", ""
-            ).lower() not in ("doublet", "1"):
+            ).lower() not in {"doublet", "2", "singlet", "1", "triplet", "3"}:
                 point = positions[identifier] + np.array([0.16, -0.16]) * bond_length
                 axis.plot(
                     *point, marker="o", markersize=stroke * 2, color="#151515", zorder=4

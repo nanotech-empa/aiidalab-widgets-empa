@@ -26,3 +26,24 @@ covalent cutoff plus 0.05 Å. Minimal mode checks all nonbonded pairs, including
 1-3 pairs, and requires thresholds above the viewer's bond cutoffs. This mode
 reduces twisting but can leave van der Waals overlaps: relax the starting model
 before a physical calculation. Both methods use the same rigid-block search.
+
+CDXML chemistry is validated with RDKit, now a required dependency. Element
+numbers use the complete ASE element table; unsupported or ambiguous node/bond
+types produce an error instead of becoming carbon or a single bond. Hydrogen
+counts respect `NumHydrogens`, explicit H nodes, formal charge and radical
+electrons. Aromatic `1.5` and directed dative bonds are distinct chemical bond
+types. Metals do not acquire implicit hydrides; explicitly drawn or labelled
+metal hydrogens are retained. Abbreviations must currently be expanded into
+explicit element atoms in ChemDraw. Encoded stereochemistry is reported but
+is not reconstructed into a stereospecific 3D model.
+
+Without C-C reference bonds, drawing scale is estimated from covalent radii,
+not interpreted as angstrom units. This supplies a starting geometry, not
+experimentally determined bond lengths. Explicit isotopic masses are retained.
+`Atoms.info["cdxml_source"]` records the source hash, original atom IDs,
+formal charges, isotopes, radicals, hydrogen labels and directed bond types.
+This is a source snapshot, not live connectivity for an edited model; transient
+index-based bonds are removed before handing the model to a structure editor.
+The snapshot and masses survive Extended XYZ export. Formal charges are not
+partial atomic charges and are not automatically translated into calculation
+charge or spin settings.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import html
 import math
 import xml.etree.ElementTree as ET
@@ -15,6 +16,7 @@ from ase.data import covalent_radii
 from ase.neighborlist import NeighborList
 from scipy.optimize import least_squares, linear_sum_assignment
 
+from .cdxml_graph import cdxml_root, read_cdxml_graph
 from .cdxml_rendering import render_cdxml_png, set_png_widget
 from .cdxml_sterics import MINIMUM_CONTACT_DISTANCES, relieve_steric_contacts
 
@@ -282,9 +284,9 @@ class CdxmlUploadWidget(ipw.VBox):
                     layout={"width": "40px"},
                 )
                 button.on_click(
-                    lambda _,
-                    selected=side,
-                    sign=direction: self._shift_bracket_drawing(selected, sign)
+                    lambda _, selected=side, sign=direction: (
+                        self._shift_bracket_drawing(selected, sign)
+                    )
                 )
                 self.bracket_shift_buttons[(side, direction)] = button
                 buttons.append(button)
@@ -445,7 +447,7 @@ class CdxmlUploadWidget(ipw.VBox):
         cls, cdxml_content: str | bytes
     ) -> list[tuple[str, int]]:
         """Find top-level structures and associate nearby captions one-to-one."""
-        root = ET.fromstring(cdxml_content)
+        root = cdxml_root(cdxml_content)
         fragments = _top_level_cdxml_fragments(root)
         if not fragments:
             if any(node.get("p") for node in root.iter("n")):
@@ -562,7 +564,7 @@ class CdxmlUploadWidget(ipw.VBox):
         cdxml_content: str | bytes, structure_index: int
     ) -> str | bytes:
         """Return CDXML containing only the selected top-level structure."""
-        root = ET.fromstring(cdxml_content)
+        root = cdxml_root(cdxml_content)
         fragments = _top_level_cdxml_fragments(root)
         if not fragments:
             if structure_index == 0 and any(node.get("p") for node in root.iter("n")):
@@ -692,7 +694,7 @@ class CdxmlUploadWidget(ipw.VBox):
         """Project the exact prepared geometry back into the drawing's scale."""
         if self.atoms is None:
             raise ValueError("No prepared geometry is available.")
-        root = ET.fromstring(content)
+        root = cdxml_root(content)
         nodes = [node for node in root.iter("n") if node.get("p")]
         original = np.array(
             [[*map(float, node.get("p").split()), 0.0] for node in nodes]
@@ -1278,87 +1280,38 @@ class CdxmlUploadWidget(ipw.VBox):
         Convert CDXML content (string) into ASE Atoms objects:
         one bare molecule (no hydrogens) and one with hydrogens.
         """
-        root = ET.fromstring(cdxml_content)
-
-        # --- Element and bond maps ---
-        element_map = {
-            "1": "H",
-            "5": "B",
-            "6": "C",
-            "7": "N",
-            "8": "O",
-            "9": "F",
-            "15": "P",
-            "16": "S",
-            "17": "Cl",
-            "26": "Fe",
-            "27": "Co",
-            "28": "Ni",
-            "22": "Ti",
-            "40": "Zr",
-            "65": "Tb",
-            "35": "Br",
-            "53": "I",
+        graph = read_cdxml_graph(cdxml_content)
+        impl_H = graph.added_hydrogens()
+        atoms = {
+            atom.id: {"el": atom.symbol, "pos": np.asarray(atom.position)}
+            for atom in graph.atoms
         }
-
-        default_valence = {
-            "H": 1,
-            "B": 3,
-            "C": 4,
-            "N": 3,
-            "O": 2,
-            "F": 1,
-            "P": 3,
-            "S": 2,
-            "Cl": 1,
-            "Br": 1,
-            "I": 1,
-            "Fe": 2,
-            "Co": 2,
-            "Ni": 2,
-            "Ti": 4,
-            "Zr": 4,
-            "Tb": 3,
-        }
-
-        bond_order_map = {
-            "1": 1.0,  # single bond
-            "2": 2.0,  # double bond
-            "3": 3.0,  # triple bond
-            "A": 1.5,  # aromatic bond
-        }
-
-        atoms, bonds, radicals = {}, [], set()
-
-        # --- Parse atoms ---
-        for n in root.iter("n"):
-            a_id = n.attrib["id"]
-            el = element_map.get(n.attrib.get("Element", ""), "C")
-            x, y = map(float, n.attrib["p"].split())
-            atoms[a_id] = {"el": el, "pos": np.array([x, y, 0.0])}
-            if "Radical" in n.attrib:
-                radicals.add(a_id)
-
-        for g in root.iter("graphic"):
-            if g.attrib.get("SymbolType") == "Electron":
-                for rep in g.iter("represent"):
-                    target = rep.attrib.get("object")
-                    if target:
-                        radicals.add(target)
-
-        # --- Parse bonds ---
-        for b in root.iter("b"):
-            a1, a2 = b.attrib["B"], b.attrib["E"]
-            order = bond_order_map.get(b.attrib.get("Order", "1"), 1.0)
-            bonds.append({"a1": a1, "a2": a2, "order": order})
+        bonds = [
+            {"a1": bond.begin, "a2": bond.end, "order": bond.order, "type": bond.type}
+            for bond in graph.bonds
+        ]
 
         # --- Scale from explicit C-C bonds, never from unrelated close atoms ---
         cc_lengths = [
             np.linalg.norm(atoms[bond["a1"]]["pos"] - atoms[bond["a2"]]["pos"])
             for bond in bonds
             if atoms[bond["a1"]]["el"] == atoms[bond["a2"]]["el"] == "C"
+            and bond["type"] != "dative"
         ]
-        scale = target_cc_length / np.median(cc_lengths) if cc_lengths else 1.0
+        if cc_lengths:
+            scale = target_cc_length / np.median(cc_lengths)
+        else:
+            from ase.data import atomic_numbers
+
+            ratios = [
+                (
+                    covalent_radii[atomic_numbers[atoms[bond["a1"]]["el"]]]
+                    + covalent_radii[atomic_numbers[atoms[bond["a2"]]["el"]]]
+                )
+                / np.linalg.norm(atoms[bond["a1"]]["pos"] - atoms[bond["a2"]]["pos"])
+                for bond in bonds
+            ]
+            scale = float(np.median(ratios)) if ratios else 1.0
         for atom in atoms.values():
             atom["pos"] *= scale
 
@@ -1402,16 +1355,6 @@ class CdxmlUploadWidget(ipw.VBox):
         bare_sym = [a["el"] for a in atoms.values()]
         bare_mol = Atoms(symbols=bare_sym, positions=bare_pos)
 
-        # --- Determine implicit hydrogens ---
-        impl_H = {}
-        for aid, a in atoms.items():
-            el = a["el"]
-            total = sum(o for _, o in conn[aid])
-            val = default_valence.get(el, 4)
-            if aid in radicals:
-                val -= 1
-            impl_H[aid] = max(0, round(val - total))
-
         # --- Add hydrogens ---
         pos, sym = list(bare_pos), list(bare_sym)
         atom_index = {aid: index for index, aid in enumerate(atoms)}
@@ -1437,6 +1380,54 @@ class CdxmlUploadWidget(ipw.VBox):
                     chemical_bonds.append((parent, len(pos), 1.0))
                     pos.append(center + length * v)
                     sym.append("H")
+
+            # Isolated methane/ammonium and unbound radical fragments require
+            # actual H positions too, rather than only a correct H count.
+            if not neighbors:
+                if nH == 4:
+                    directions = np.asarray(
+                        [[1, 1, 1], [1, -1, -1], [-1, 1, -1], [-1, -1, 1]],
+                        dtype=float,
+                    ) / math.sqrt(3)
+                elif nH == 3:
+                    height = 1 / 3 if el == "N" else 0.0
+                    radius = math.sqrt(1 - height**2)
+                    directions = [
+                        np.array(
+                            [radius * math.cos(phi), radius * math.sin(phi), height]
+                        )
+                        for phi in (0, 2 * math.pi / 3, 4 * math.pi / 3)
+                    ]
+                elif el == "C" and nH == 2:
+                    directions = [
+                        np.array([0.5, sign * math.sqrt(3) / 2, 0]) for sign in (-1, 1)
+                    ]
+                elif nH == 1:
+                    directions = [np.array([1.0, 0.0, 0.0])]
+                else:
+                    directions = None
+                if directions is not None:
+                    add_H(directions, 1.00 if el == "N" else 1.09)
+                    continue
+
+            # NH3 attached by a single bond (e.g. methylammonium) shares the
+            # tetrahedral construction used for terminal carbon methyl groups.
+            if el == "N" and nH == 3 and len(neighbors) == 1:
+                axis = neighbors[0]
+                perpendicular = normalize(np.cross(axis, [0, 0, 1]))
+                if np.linalg.norm(perpendicular) < 1e-8:
+                    perpendicular = np.array([1.0, 0.0, 0.0])
+                other = np.cross(axis, perpendicular)
+                add_H(
+                    [
+                        -axis / 3
+                        + math.sqrt(8 / 9)
+                        * (math.cos(phi) * perpendicular + math.sin(phi) * other)
+                        for phi in (0, 2 * math.pi / 3, 4 * math.pi / 3)
+                    ],
+                    1.00,
+                )
+                continue
 
             # --- Oxygen or Nitrogen (improved geometry) ---
             if el in ("O", "N"):
@@ -1483,7 +1474,26 @@ class CdxmlUploadWidget(ipw.VBox):
                     if neighbors
                     else np.array([0, 0, 1])
                 )
-                add_H([avg], 1.01)
+                if np.linalg.norm(avg) < 1e-8:
+                    avg = np.array([0.0, 0.0, 1.0])
+                if nH == 1:
+                    directions = [avg]
+                else:
+                    # An explicit multi-H heteroatom label must retain every H.
+                    tangent = normalize(np.cross(avg, [0, 0, 1]))
+                    if np.linalg.norm(tangent) < 1e-8:
+                        tangent = np.array([1.0, 0.0, 0.0])
+                    other = np.cross(avg, tangent)
+                    directions = [
+                        normalize(avg + math.cos(phi) * tangent + math.sin(phi) * other)
+                        for phi in np.linspace(0, 2 * math.pi, nH, endpoint=False)
+                    ]
+                from ase.data import atomic_numbers
+
+                length = {"B": 1.19, "Si": 1.48, "P": 1.42, "S": 1.34}.get(
+                    el, covalent_radii[atomic_numbers[el]] + covalent_radii[1]
+                )
+                add_H(directions, length)
                 continue
 
             # --- Carbon atoms (original logic, untouched) ---
@@ -1534,13 +1544,17 @@ class CdxmlUploadWidget(ipw.VBox):
                             for p in (0, 2 * math.pi / 3)
                         ]
                         R = rotation_matrix_from_vectors(np.array([0, 0, 1]), -v)
-                        add_H([R @ d for d in dirs], CH_len)
+                        add_H([-R @ d for d in dirs], CH_len)
                     continue
 
                 if len(neighbors) == 2:
                     v1, v2 = neighbors
                     bis = normalize(-(v1 + v2))
                     plane_normal = normalize(np.cross(v1, v2))
+                    if np.linalg.norm(plane_normal) < 1e-8:
+                        plane_normal = np.array([0.0, 0.0, 1.0])
+                    if np.linalg.norm(bis) < 1e-8:
+                        bis = normalize(np.cross(v1, plane_normal))
                     if any(o >= 1.5 for o in orders):
                         add_H(
                             [
@@ -1551,7 +1565,7 @@ class CdxmlUploadWidget(ipw.VBox):
                         )
                     else:
                         angle = math.radians(54.75)
-                        perp = normalize(np.cross(v1, v2))
+                        perp = plane_normal
                         add_H(
                             [
                                 math.cos(angle) * bis + math.sin(angle) * perp,
@@ -1564,19 +1578,52 @@ class CdxmlUploadWidget(ipw.VBox):
             # CH
             if nH == 1:
                 avg = normalize(-np.sum(neighbors, axis=0))
+                if np.linalg.norm(avg) < 1e-8:
+                    avg = normalize(np.cross(neighbors[0], [0, 0, 1]))
                 add_H([avg], 1.09)
 
         mol = Atoms(symbols=sym, positions=pos)
+        from rdkit import Chem
+
+        for index, spec in enumerate(graph.atoms):
+            if spec.isotope:
+                mass = Chem.GetPeriodicTable().GetMassForIsotope(
+                    spec.number, spec.isotope
+                )
+                if mass <= 0:
+                    raise ValueError(
+                        f"Unknown isotope {spec.isotope} for atom {spec.id} ({spec.symbol})."
+                    )
+                bare_mol[index].mass = mol[index].mass = mass
+        source = (
+            cdxml_content.encode() if isinstance(cdxml_content, str) else cdxml_content
+        )
+        mol.info["cdxml_source"] = {
+            "schema": 1,
+            "sha256": hashlib.sha256(source).hexdigest(),
+            "formal_charge": sum(atom.charge for atom in graph.atoms),
+            "atoms": {
+                atom.id: {
+                    "element": atom.symbol,
+                    "formal_charge": atom.charge,
+                    "isotope": atom.isotope,
+                    "radical_electrons": atom.radical_electrons,
+                    "declared_hydrogens": atom.hydrogens,
+                    "added_hydrogens": impl_H[atom.id],
+                }
+                for atom in graph.atoms
+            },
+            "bonds": [
+                {"begin": bond.begin, "end": bond.end, "type": bond.type}
+                for bond in graph.bonds
+            ],
+        }
         # Transient conversion metadata, consumed before storing/exporting the
         # finite model. Close geometric contacts never enter this bond list.
         mol.info["_cdxml_bonds"] = chemical_bonds
-        mol.info["_cdxml_stereochemistry"] = any(
-            "wedge" in b.get("Display", "").lower()
-            or "hash" in b.get("Display", "").lower()
-            or "wavy" in b.get("Display", "").lower()
-            or b.get("BS", "U") not in {"", "N", "U"}
-            for b in root.iter("b")
-        ) or any(n.get("AS", "U") not in {"", "N", "U"} for n in root.iter("n"))
+        mol.info["_cdxml_stereochemistry"] = graph.stereochemistry
+        if graph.stereochemistry:
+            geometry_message += " Warning: encoded stereochemistry is retained in the source drawing but is not reconstructed in this starting model."
         msg = geometry_message
         return msg, bare_mol, mol
 
@@ -1618,7 +1665,7 @@ class CdxmlUploadWidget(ipw.VBox):
         ChemDraw may serialize the right bracket before the left bracket. Crossing
         matching must therefore be independent of both XML order and vector sign.
         """
-        root = ET.fromstring(cdxml_content)
+        root = cdxml_root(cdxml_content)
 
         atom_positions, atom_id_map = [], {}
         for node in root.findall(".//n"):

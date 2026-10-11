@@ -282,7 +282,7 @@ def test_widget_reports_missing_and_malformed_cdxml(monkeypatch):
 
     widget._cdxml_content = b"<CDXML><broken>"
     assert not widget._convert_uploaded_cdxml()
-    assert "Unexpected error" in widget.output_message.value
+    assert "Error: Invalid CDXML" in widget.output_message.value
 
     def reject_cdxml(*args, **kwargs):
         raise ValueError("invalid <bond>")
