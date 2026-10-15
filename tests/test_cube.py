@@ -187,6 +187,8 @@ def test_saved_view_restores_camera_surfaces_and_slice_in_3d_tab():
     viewer.slice2d.normal_txt.value = "1 0 0"
     viewer.viewer3d.show_plane_checkbox.value = True
     viewer.background.value = "#123456"
+    viewer.light_ambient.value = 0.35
+    viewer.light_gloss.value = 0.25
     snapshot = viewer.view_settings()
     assert snapshot["render"]["slice_plane"]["offset"] == 0.3
     viewer.viewer3d.viewer._camera_orientation = np.eye(4).ravel().tolist()
@@ -194,6 +196,7 @@ def test_saved_view_restores_camera_surfaces_and_slice_in_3d_tab():
     viewer.slice2d.normal_txt.value = "0 0 1"
     viewer.viewer3d.show_plane_checkbox.value = False
     viewer.background.value = "#FFFFFF"
+    viewer.lighting_preset.value = "matte"
     viewer.viewer3d.isovalues.isovalues.children[0].value = 0.01
     viewer.apply_view_settings(snapshot)
     assert viewer.view_settings() == snapshot
@@ -204,6 +207,42 @@ def test_saved_view_restores_camera_surfaces_and_slice_in_3d_tab():
     )
     assert viewer.slice2d.children == (viewer.slice2d.plot_controls,)
     assert viewer.viewer3d._plane_component is not None
+    viewer.close()
+
+
+def test_automatic_signed_colours_keep_zero_neutral_and_manual_limits():
+    from matplotlib import colormaps
+
+    cut = CubePlaneCut2D()
+    values = np.array([[-0.28, 0.01], [0, np.nan]])
+    limits = cut._effective_color_range(values)
+    assert limits == (-0.28, 0.28)
+    cut._store_slice_cache(None, values, *limits)
+    np.testing.assert_allclose(cut._last_rgb[1, 0], colormaps["coolwarm"](0.5)[:3])
+    assert np.isnan(cut._last_rgb[1, 1]).all()
+    cut.center_color_range.value = False
+    assert cut._effective_color_range(values) == (-0.28, 0.01)
+    cut.auto_color_range.value = False
+    cut.vmin.value, cut.vmax.value = -0.1, 0.2
+    assert cut._effective_color_range(values) == (-0.1, 0.2)
+    assert cut.center_color_range.disabled
+    cut.close()
+
+
+def test_old_view_preserves_its_asymmetric_colour_scale():
+    viewer = CubeViewer()
+    viewer.set_cube(sample_cube())
+    viewer.viewer3d.viewer._camera_orientation = np.eye(4).ravel().tolist()
+    viewer.slice2d.center_color_range.value = False
+    snapshot = viewer.view_settings()
+    del snapshot["plane"]["center_color_range"]
+    del snapshot["render"]["lighting"]
+    viewer.slice2d.center_color_range.value = True
+    viewer.apply_view_settings(snapshot)
+    assert not viewer.slice2d.center_color_range.value
+    assert viewer.slice2d.vmin.value == snapshot["plane"]["vmin"]
+    assert viewer.slice2d.vmax.value == snapshot["plane"]["vmax"]
+    assert viewer.lighting_preset.value == "soft"
     viewer.close()
 
 

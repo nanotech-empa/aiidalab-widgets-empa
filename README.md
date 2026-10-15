@@ -107,7 +107,7 @@ preserves the cube origin and leaves out-of-grid samples empty. Periodic
 sampling is an explicit constructor option.
 
 `on_render` receives a plain dictionary containing the camera orientation,
-coloured isovalues, image size, background and opacity, plus `slice_plane` when
+coloured isovalues, image size, background, opacity and `lighting`, plus `slice_plane` when
 the plane is visible. The application owns
 CalcJob submission and source-file availability checks. The widget never
 launches a local renderer. The 2D plot can be exported directly as a PNG.
@@ -124,6 +124,13 @@ restores that view.
 even for older snapshots whose render settings predate this feature. Its frozen
 colour limits keep the rendered colour mapping consistent with the saved view;
 cubehandler samples the selected preview or full cube at rendering time.
+
+New views centre the automatic colour range on zero, with an option for the
+original min/max scale or manual limits. The 3D plane is unlit and has a visible
+colour legend; lighting cannot wash out its data colours. Soft/Matte presets and
+manual ambient, direct-light and gloss controls affect atoms and isosurfaces and
+are saved with the view. Older views retain their original colour-scale mode.
+Preview and renderer lighting engines differ, so shading is not pixel-identical.
 
 `aiidalab_widgets_empa.cube_views.SavedCubeViews` supplies named-view controls:
 save, restore, update, remove and render multiple selected views. Applications

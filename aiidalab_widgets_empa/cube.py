@@ -274,6 +274,9 @@ class CubePlaneCut2D(ipw.VBox):
             description="Auto color range",
         )
         self.auto_color_range.observe(self._on_auto_color_range_toggled, names="value")
+        self.center_color_range = ipw.Checkbox(
+            value=True, description="Centre automatic scale on zero"
+        )
         self.vmin = ipw.FloatText(
             value=0.0,
             description="vmin",
@@ -315,6 +318,15 @@ class CubePlaneCut2D(ipw.VBox):
         self._out = ipw.Output(layout=ipw.Layout(width="100%"))
         self.image = ipw.Image(format="png")
         self.slice_png = b""
+        self.color_legend = ipw.HTML()
+        self.color_controls = ipw.VBox(
+            [
+                self.auto_color_range,
+                self.center_color_range,
+                ipw.HBox([self.vmin, self.vmax]),
+                self.color_legend,
+            ]
+        )
 
         self.plane_controls = ipw.VBox(
             [
@@ -338,14 +350,14 @@ class CubePlaneCut2D(ipw.VBox):
                 ipw.HBox([self.offset_txt]),
                 ipw.HBox([self.width, self.height]),
                 self.res,
+                self.color_controls,
                 self.error,
             ]
         )
         self.plot_controls = ipw.VBox(
             [
-                ipw.HBox(
-                    [self.show_contours, self.auto_color_range, self.vmin, self.vmax]
-                ),
+                self.color_controls,
+                self.show_contours,
                 self.show_2d_checkbox,
                 self.info,
                 self.image,
@@ -363,6 +375,7 @@ class CubePlaneCut2D(ipw.VBox):
             self.res,
             self.show_contours,
             self.auto_color_range,
+            self.center_color_range,
             self.vmin,
             self.vmax,
         ):
@@ -432,6 +445,7 @@ class CubePlaneCut2D(ipw.VBox):
         use_auto = change["new"]
         self.vmin.disabled = use_auto
         self.vmax.disabled = use_auto
+        self.center_color_range.disabled = not use_auto
         if self._inputs_valid():
             self.plot_slice()
 
@@ -523,6 +537,10 @@ class CubePlaneCut2D(ipw.VBox):
     def _effective_color_range(self, values):
         if self.auto_color_range.value:
             finite = values[np.isfinite(values)]
+            if self.center_color_range.value:
+                limit = float(np.max(np.abs(finite))) if finite.size else 0.0
+                limit = limit or 1.0
+                return -limit, limit
             return (
                 (float(finite.min()), float(finite.max()))
                 if finite.size
@@ -537,6 +555,13 @@ class CubePlaneCut2D(ipw.VBox):
         self._last_vals = values
         self._last_rgb = cmap(normalizer(values))[..., :3]
         self._last_rgb[~np.isfinite(values)] = np.nan
+        stops = ",".join(mcolors.to_hex(cmap(x)) for x in np.linspace(0, 1, 11))
+        self.color_legend.value = (
+            f'<div style="width:300px;height:12px;background:linear-gradient(to right,{stops})"></div>'
+            f'<div style="width:300px;display:flex;justify-content:space-between">'
+            f"<span>{vmin:.3g}</span><span>{(vmin + vmax) / 2:.3g}</span><span>{vmax:.3g}</span></div>"
+            "<small>Cube values (a.u.). Plane colours are unaffected by lighting.</small>"
+        )
 
     def plot_slice(self):
         if self.cube is None:
@@ -638,6 +663,7 @@ class CubePlaneCut2D(ipw.VBox):
             "show_2d": bool(self.show_2d_checkbox.value),
             "show_contours": bool(self.show_contours.value),
             "auto_color_range": bool(self.auto_color_range.value),
+            "center_color_range": bool(self.center_color_range.value),
             "vmin": float(self.vmin.value),
             "vmax": float(self.vmax.value),
         }
@@ -658,6 +684,8 @@ class CubeArrayData3dViewerWidget(ipw.VBox):
         self._plane_component = None
         self.slice2d = None
         self._external_plane_sync_cb = None
+        self.lighting = dict(ambient=0.45, direct=0.55, gloss=0.15)
+        self._apply_stage_lighting()
 
         self.show_isosurfaes_button = ipw.Button(
             description="Update isosurfaces",
@@ -749,6 +777,10 @@ class CubeArrayData3dViewerWidget(ipw.VBox):
         self._structure_component = self.viewer.add_component(
             nglview.ASEStructure(self.structure)
         )
+        self._structure_component.clear()
+        self._structure_component.add_ball_and_stick(
+            roughness=1 - self.lighting["gloss"]
+        )
         with tempfile.NamedTemporaryFile(mode="w") as tempf:
             ase.io.cube.write_cube(
                 tempf,
@@ -781,20 +813,29 @@ class CubeArrayData3dViewerWidget(ipw.VBox):
         for isov, col in zip(isovals, colors):
             try:
                 self._cube_component.add_surface(
-                    color=col, isolevelType="value", isolevel=isov
+                    color=col,
+                    isolevelType="value",
+                    isolevel=isov,
+                    roughness=1 - self.lighting["gloss"],
+                    metalness=0,
                 )
             except Exception:
                 logger.debug("add_surface failed", exc_info=True)
 
-    def _capture_newest_component_as_plane(self, before_attrs):
-        after = {name for name in dir(self.viewer) if name.startswith("component_")}
-        new_attrs = sorted(after - before_attrs)
-        if not new_attrs:
-            return
-        try:
-            self._plane_component = getattr(self.viewer, new_attrs[-1])
-        except Exception:
-            logger.debug("capturing plane component failed", exc_info=True)
+    def _apply_stage_lighting(self):
+        self.viewer.parameters = dict(
+            ambientIntensity=self.lighting["ambient"],
+            lightIntensity=self.lighting["direct"],
+        )
+
+    def set_lighting(self, settings):
+        self.lighting = dict(settings)
+        self._apply_stage_lighting()
+        self.apply_isosurfaces()
+        if self._structure_component is not None:
+            self._structure_component.update_ball_and_stick(
+                roughness=1 - settings["gloss"], metalness=0
+            )
 
     def hide_and_remove_plane(self):
         if self._plane_component is None:
@@ -825,7 +866,6 @@ class CubeArrayData3dViewerWidget(ipw.VBox):
             return
 
         self.hide_and_remove_plane()
-        before = {name for name in dir(self.viewer) if name.startswith("component_")}
         colors_2d = getattr(self.slice2d, "_last_rgb", None)
 
         try:
@@ -838,12 +878,20 @@ class CubeArrayData3dViewerWidget(ipw.VBox):
                 colors_2d=colors_2d,
                 max_grid_n=self.plane_resolution.value,
             )
-            self.viewer.shape.add_mesh(vertices, colors)
+            self._plane_component = self.viewer.shape.add_mesh(vertices, colors)
+            index = self.viewer._ngl_component_ids.index(self._plane_component.id)
+            # NGL's background buffer flag selects its NOLIGHT shader. Set it
+            # AFTER attachment so the plane stays in the depth-tested model
+            # group, rather than becoming a backdrop behind all the atoms.
+            self.viewer._execute_js_code(
+                f"this.stage.compList[{index}].reprList.forEach(item => "
+                "item.repr.bufferList.forEach(buffer => "
+                "buffer.setParameters({background: true})));"
+                "this.stage.viewer.requestRender();"
+            )
         except Exception:
             logger.debug("plane mesh update failed", exc_info=True)
             return
-
-        self._capture_newest_component_as_plane(before)
 
 
 class CubeViewer(ipw.VBox):
@@ -867,6 +915,7 @@ class CubeViewer(ipw.VBox):
             self.slice2d.height,
             self.slice2d.res,
             self.slice2d.auto_color_range,
+            self.slice2d.center_color_range,
             self.slice2d.vmin,
             self.slice2d.vmax,
             self.viewer3d.plane_resolution,
@@ -888,6 +937,60 @@ class CubeViewer(ipw.VBox):
             ],
             layout=ipw.Layout(width="440px"),
         )
+        self.lighting_preset = ipw.Dropdown(
+            options=[
+                ("Soft (recommended)", "soft"),
+                ("Matte", "matte"),
+                ("Manual", "manual"),
+            ],
+            description="Lighting",
+        )
+        self.light_ambient = ipw.FloatSlider(
+            value=0.45,
+            min=0,
+            max=1,
+            step=0.05,
+            description="Ambient",
+            continuous_update=False,
+        )
+        self.light_direct = ipw.FloatSlider(
+            value=0.55,
+            min=0,
+            max=1,
+            step=0.05,
+            description="Direct light",
+            continuous_update=False,
+        )
+        self.light_gloss = ipw.FloatSlider(
+            value=0.15,
+            min=0,
+            max=1,
+            step=0.05,
+            description="Gloss",
+            continuous_update=False,
+        )
+        self._updating_lighting = False
+        self.lighting_preset.observe(self._on_lighting_preset, names="value")
+        for field in (self.light_ambient, self.light_direct, self.light_gloss):
+            field.observe(self._on_lighting_changed, names="value")
+        lighting_controls = ipw.Accordion(
+            children=[
+                ipw.VBox(
+                    [
+                        self.lighting_preset,
+                        self.light_ambient,
+                        self.light_direct,
+                        self.light_gloss,
+                        ipw.HTML(
+                            "<small>Lighting affects atoms and isosurfaces. The data plane keeps its colour scale.</small>"
+                        ),
+                    ]
+                )
+            ],
+            selected_index=None,
+        )
+        lighting_controls.set_title(0, "Lighting")
+        plane_controls.children += (lighting_controls,)
         self.viewer3d.children = (
             ipw.HBox(
                 [canvas_column, plane_controls],
@@ -951,6 +1054,40 @@ class CubeViewer(ipw.VBox):
         self.tabs.observe(self._resize, names="selected_index")
         super().__init__([self.tabs], **kwargs)
 
+    def _on_lighting_preset(self, change):
+        if self._updating_lighting or change["new"] == "manual":
+            return
+        self._set_lighting(
+            dict(ambient=0.45, direct=0.55, gloss=0.15)
+            if change["new"] == "soft"
+            else dict(ambient=0.6, direct=0.4, gloss=0.0)
+        )
+
+    def _set_lighting(self, settings):
+        self._updating_lighting = True
+        try:
+            for key, value in settings.items():
+                getattr(self, "light_" + key).value = value
+            self.lighting_preset.value = (
+                "soft"
+                if settings == dict(ambient=0.45, direct=0.55, gloss=0.15)
+                else "matte"
+                if settings == dict(ambient=0.6, direct=0.4, gloss=0.0)
+                else "manual"
+            )
+        finally:
+            self._updating_lighting = False
+        self.viewer3d.set_lighting(settings)
+
+    def _on_lighting_changed(self, _):
+        if not self._updating_lighting:
+            self._set_lighting(
+                {
+                    key: getattr(self, "light_" + key).value
+                    for key in ("ambient", "direct", "gloss")
+                }
+            )
+
     def set_cube(self, cube):
         self.slice_download.value = ""
         self.viewer3d.cube = cube
@@ -992,6 +1129,7 @@ class CubeViewer(ipw.VBox):
             height=self.height.value,
             background=self.background.value,
             opacity=self.opacity.value,
+            lighting=dict(self.viewer3d.lighting),
         )
         if self.viewer3d.show_plane_checkbox.value:
             settings["slice_plane"] = render_plane_settings(
@@ -1027,6 +1165,9 @@ class CubeViewer(ipw.VBox):
         self.viewer3d.apply_isosurfaces()
         for key in ("width", "height", "background", "opacity"):
             getattr(self, key).value = render[key]
+        self._set_lighting(
+            render.get("lighting", dict(ambient=0.45, direct=0.55, gloss=0.15))
+        )
         cut = self.slice2d
         # Suppress intermediate slices while restoring the complete plane.
         cut._updating_color_range = True
@@ -1034,6 +1175,9 @@ class CubeViewer(ipw.VBox):
             for key in ("center", "normal"):
                 getattr(cut, key + "_txt").value = " ".join(map(str, plane[key]))
             cut.offset_txt.value = str(plane["offset"])
+            # Older snapshots used asymmetric min/max autoscaling. Keep that
+            # appearance until the user explicitly selects the centred scale.
+            cut.center_color_range.value = plane.get("center_color_range", False)
             for attr, key in (
                 ("width", "width"),
                 ("height", "height"),
