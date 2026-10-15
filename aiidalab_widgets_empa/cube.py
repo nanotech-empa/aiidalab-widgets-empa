@@ -394,7 +394,9 @@ class CubePlaneCut2D(ipw.VBox):
             self.error.value = ""
             self.plot_slice()
         else:
-            self.error.value = ""
+            self.error.value = "<span style='color:#b00'>Enter a valid plane before displaying a slice.</span>"
+            self.image.value = b""
+            self.slice_png = b""
             with self._out:
                 self._out.clear_output(wait=True)
 
@@ -438,6 +440,8 @@ class CubePlaneCut2D(ipw.VBox):
         if self.cube is None:
             self._sinv = None
             self.info.value = ""
+            self.image.value = b""
+            self.slice_png = b""
             with self._out:
                 self._out.clear_output()
             return
@@ -537,6 +541,8 @@ class CubePlaneCut2D(ipw.VBox):
         except Exception:
             logger.debug("cube plane slice failed", exc_info=True)
             self.error.value = "<span style='color:#b00'>Error computing slice</span>"
+            self.image.value = b""
+            self.slice_png = b""
             with self._out:
                 self._out.clear_output()
             return

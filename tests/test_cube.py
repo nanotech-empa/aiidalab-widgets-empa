@@ -72,3 +72,108 @@ def test_viewer_preserves_volume_origin_and_signed_values(monkeypatch):
     assert viewer.slice2d.slice_png.startswith(b"\x89PNG")
     assert not viewer.slice2d.periodic
     viewer.close()
+
+
+def test_slice_controls_and_invalid_edit_clear_the_old_image():
+    viewer = CubeViewer()
+    viewer.set_cube(sample_cube())
+    cut = viewer.slice2d
+    cut.plane_preset.value = "1 0 0"
+    cut.apply_plane_preset.click()
+    cut.offset_txt.value = ".3"
+    cut.show_contours.value = True
+    cut.auto_color_range.value = False
+    cut.vmin.value, cut.vmax.value = -30, 30
+    cut.show_2d_checkbox.value = False
+    assert cut.image.layout.display == "none"
+    cut.show_2d_checkbox.value = True
+    assert cut.image.layout.display == "" and cut.slice_png
+    assert cut.return_settings()["normal"] == [1.0, 0.0, 0.0]
+    viewer._export_slice()
+    assert "Download 2D slice PNG" in viewer.slice_download.value
+    cut.center_txt.value = "incomplete"
+    assert not cut.image.value and not cut.slice_png
+    assert "valid plane" in cut.error.value
+    cut.center_on_atoms.click()
+    assert cut.image.value and not cut.error.value
+    viewer.viewer3d.show_plane_checkbox.value = True
+    cut.res.value = 32
+    assert viewer.viewer3d._plane_component is not None
+    viewer.viewer3d.show_plane_checkbox.value = False
+    viewer.set_cube(None)
+    assert viewer.viewer3d._cube_component is None
+    assert not cut.image.value
+    viewer.close()
+
+
+def test_render_callback_contains_only_selected_view_settings():
+    submitted = []
+    viewer = CubeViewer(on_render=submitted.append)
+    viewer.render_button.click()
+    assert "camera" in viewer.render_message.value
+    viewer.set_cube(sample_cube())
+    viewer.viewer3d.viewer._camera_orientation = [
+        20.0,
+        0,
+        0,
+        0,
+        0,
+        20.0,
+        0,
+        0,
+        0,
+        0,
+        20.0,
+        0,
+        0,
+        0,
+        0,
+        1.0,
+    ]
+    rows = viewer.viewer3d.isovalues
+    rows.add_isovalue()
+    rows.isovalues.children[-1].value = 0.005
+    rows.isovalues.children[-1].color_widget.value = "#123456"
+    viewer.width.value, viewer.height.value = 640, 480
+    viewer.background.value = "#ABCDEF"
+    viewer.opacity.value = 0.7
+    viewer.tabs.selected_index = 2
+    viewer.render_button.click()
+    assert submitted[0]["iso"][-1] == [0.005, "#123456"]
+    assert submitted[0]["background"] == "#ABCDEF"
+    assert (submitted[0]["width"], submitted[0]["height"], submitted[0]["opacity"]) == (
+        640,
+        480,
+        0.7,
+    )
+    rows.remove_isovalue()
+    viewer.tabs.selected_index = 0
+    viewer.viewer3d.update_plot()
+    while rows.isovalues.children:
+        rows.remove_isovalue()
+    viewer.render_button.click()
+    assert "at least one" in viewer.render_message.value
+    assert len(submitted) == 1
+    viewer.close()
+
+
+def test_cube_switch_keeps_user_isovalues_within_new_range(tmp_path):
+    viewer = CubeViewer()
+    cube = sample_cube()
+    # Use the actual file import path rather than the internal Cube setter.
+    path = tmp_path / "cube.cube"
+    with path.open("w") as handle:
+        write_cube(handle, cube.ase_atoms, cube.data, origin=cube.origin / ANG_TO_BOHR)
+    viewer.set_content(path.read_text())
+    viewer.viewer3d.isovalues.isovalues.children[0].value = 0.01
+    other = cube.copy()
+    other.data[:] = -0.1
+    viewer.set_cube(other)
+    assert all(
+        row.value == -0.1 for row in viewer.viewer3d.isovalues.isovalues.children
+    )
+    other = cube.copy()
+    other.data[:] = 0.5
+    viewer.set_cube(other)
+    assert all(row.value == 0.5 for row in viewer.viewer3d.isovalues.isovalues.children)
+    viewer.close()
