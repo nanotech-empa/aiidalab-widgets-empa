@@ -33,6 +33,7 @@ dependencies = [
 Homepage = "https://github.com/nanotech-empa/aiidalab-widgets-empa"
 
 [project.optional-dependencies]
+cube = ["cubehandler", "nglview"]
 dev = [
     "pytest",
     "pytest-cov",
