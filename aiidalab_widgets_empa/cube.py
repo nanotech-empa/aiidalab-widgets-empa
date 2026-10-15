@@ -21,6 +21,7 @@ import traitlets as tl
 from cubehandler import Cube
 from cubehandler.cube import ANG_TO_BOHR
 from scipy.ndimage import map_coordinates
+from .cube_views import render_plane_settings
 
 logger = logging.getLogger(__name__)
 ERR_EXPECT_3_FLOATS = "Expected 3 finite floats"
@@ -934,7 +935,7 @@ class CubeViewer(ipw.VBox):
                 ipw.VBox(
                     [
                         ipw.HTML(
-                            "<p>Render the selected cube and current 3D camera/isosurfaces through the application. The 2D plane is exported separately.</p>"
+                            "<p>Render the selected cube, current camera, isosurfaces and visible slicing plane through the application. The flat 2D plot can also be exported separately.</p>"
                         ),
                         ipw.HBox([self.width, self.height]),
                         self.background,
@@ -984,7 +985,7 @@ class CubeViewer(ipw.VBox):
         ]
         if not pairs:
             raise ValueError("Add at least one isosurface before rendering.")
-        return dict(
+        settings = dict(
             orientation=orientation,
             iso=pairs,
             width=self.width.value,
@@ -992,6 +993,11 @@ class CubeViewer(ipw.VBox):
             background=self.background.value,
             opacity=self.opacity.value,
         )
+        if self.viewer3d.show_plane_checkbox.value:
+            settings["slice_plane"] = render_plane_settings(
+                self.slice2d.return_settings()
+            )
+        return settings
 
     def view_settings(self):
         """Snapshot the view as plain data, including the linked slice plane."""

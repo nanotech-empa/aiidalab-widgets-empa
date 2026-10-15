@@ -107,7 +107,8 @@ preserves the cube origin and leaves out-of-grid samples empty. Periodic
 sampling is an explicit constructor option.
 
 `on_render` receives a plain dictionary containing the camera orientation,
-coloured isovalues, image size, background and opacity. The application owns
+coloured isovalues, image size, background and opacity, plus `slice_plane` when
+the plane is visible. The application owns
 CalcJob submission and source-file availability checks. The widget never
 launches a local renderer. The 2D plot can be exported directly as a PNG.
 The original Surfaces calculation browser has not yet been switched to this
@@ -118,6 +119,11 @@ the slice image and export controls. `viewer.view_settings()` returns a versione
 plain-data snapshot of camera, surfaces, render options and slice settings.
 After loading the corresponding cube, `viewer.apply_view_settings(snapshot)`
 restores that view.
+
+`render_settings_from_view(snapshot)` in `cube_views` includes the visible plane
+even for older snapshots whose render settings predate this feature. Its frozen
+colour limits keep the rendered colour mapping consistent with the saved view;
+cubehandler samples the selected preview or full cube at rendering time.
 
 `aiidalab_widgets_empa.cube_views.SavedCubeViews` supplies named-view controls:
 save, restore, update, remove and render multiple selected views. Applications

@@ -188,6 +188,7 @@ def test_saved_view_restores_camera_surfaces_and_slice_in_3d_tab():
     viewer.viewer3d.show_plane_checkbox.value = True
     viewer.background.value = "#123456"
     snapshot = viewer.view_settings()
+    assert snapshot["render"]["slice_plane"]["offset"] == 0.3
     viewer.viewer3d.viewer._camera_orientation = np.eye(4).ravel().tolist()
     viewer.slice2d.offset_txt.value = "0"
     viewer.slice2d.normal_txt.value = "0 0 1"
@@ -203,6 +204,28 @@ def test_saved_view_restores_camera_surfaces_and_slice_in_3d_tab():
     )
     assert viewer.slice2d.children == (viewer.slice2d.plot_controls,)
     assert viewer.viewer3d._plane_component is not None
+    viewer.close()
+
+
+def test_old_saved_view_includes_visible_plane_without_mutating_record():
+    from copy import deepcopy
+    from aiidalab_widgets_empa.cube_views import render_settings_from_view
+
+    viewer = CubeViewer()
+    viewer.set_cube(sample_cube())
+    viewer.viewer3d.viewer._camera_orientation = np.eye(4).ravel().tolist()
+    viewer.viewer3d.show_plane_checkbox.value = True
+    snapshot = viewer.view_settings()
+    del snapshot["render"]["slice_plane"]  # Previous saved-view format.
+    original = deepcopy(snapshot)
+    settings = render_settings_from_view(snapshot)
+    assert settings["slice_plane"]["center"] == snapshot["plane"]["center"]
+    assert settings["slice_plane"]["periodic"] is False
+    assert snapshot == original
+    snapshot["show_plane"] = False
+    assert "slice_plane" not in render_settings_from_view(snapshot)
+    viewer.viewer3d.show_plane_checkbox.value = False
+    assert "slice_plane" not in viewer.render_settings()
     viewer.close()
 
 

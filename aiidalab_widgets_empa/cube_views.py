@@ -1,8 +1,37 @@
 """Named cube views; applications own persistence and CalcJob submission."""
 
 import html
+from copy import deepcopy
 
 import ipywidgets as ipw
+
+
+def render_plane_settings(plane):
+    """Keep the sampled plane's geometry, boundaries and displayed colour range."""
+    return {
+        key: deepcopy(plane[key])
+        for key in (
+            "center",
+            "normal",
+            "offset",
+            "width",
+            "height",
+            "resolution",
+            "vmin",
+            "vmax",
+            "periodic",
+        )
+    }
+
+
+def render_settings_from_view(view):
+    """Include visible planes, also for saved views predating plane rendering."""
+    settings = deepcopy(view["render"])
+    if view.get("show_plane", False):
+        settings["slice_plane"] = render_plane_settings(view["plane"])
+    else:
+        settings.pop("slice_plane", None)
+    return settings
 
 
 class SavedCubeViews(ipw.VBox):
