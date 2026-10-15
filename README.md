@@ -87,3 +87,28 @@ that omitted order meant single, requiring two methine H which coordinate
 clipping silently discarded. Tests also cover the original missing-double case
 (C14H6), the corrected independently ASE-checked repeat (C14H4), and retention
 of every finite end-fragment H.
+
+## Cube viewer
+
+Install the `cube` extra and import the data-only viewer explicitly:
+
+```python
+from aiidalab_widgets_empa.cube import CubeViewer
+
+viewer = CubeViewer(periodic=False, on_render=submit_render_calcjob)
+viewer.set_content(cube_file_contents)
+```
+
+The shared 3D isosurfaces and linked 2D plane controls originate in the Surfaces
+Handle cube files viewer. The extraction preserves the original MIT notice in
+`aiidalab_widgets_empa/CUBE_VIEWER_LICENSE.txt`. It has no CP2K workflow or
+calculation-browser dependency and retains no AiiDA nodes. Molecular mode
+preserves the cube origin and leaves out-of-grid samples empty. Periodic
+sampling is an explicit constructor option.
+
+`on_render` receives a plain dictionary containing the camera orientation,
+coloured isovalues, image size, background and opacity. The application owns
+CalcJob submission and source-file availability checks. The widget never
+launches a local renderer. The 2D plot can be exported directly as a PNG.
+The original Surfaces calculation browser has not yet been switched to this
+shared component; that migration belongs in its maintained app component PR.
