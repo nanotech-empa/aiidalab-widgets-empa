@@ -315,7 +315,7 @@ class CubePlaneCut2D(ipw.VBox):
         self.image = ipw.Image(format="png")
         self.slice_png = b""
 
-        super().__init__(
+        self.plane_controls = ipw.VBox(
             [
                 ipw.HTML(
                     "<b>2D plane cut</b> · "
@@ -335,17 +335,23 @@ class CubePlaneCut2D(ipw.VBox):
                     ]
                 ),
                 ipw.HBox([self.offset_txt]),
-                ipw.HBox([self.width, self.height, self.res]),
+                ipw.HBox([self.width, self.height]),
+                self.res,
+                self.error,
+            ]
+        )
+        self.plot_controls = ipw.VBox(
+            [
                 ipw.HBox(
                     [self.show_contours, self.auto_color_range, self.vmin, self.vmax]
                 ),
                 self.show_2d_checkbox,
                 self.info,
-                self.error,
                 self.image,
                 self._out,
             ]
         )
+        super().__init__([self.plane_controls, self.plot_controls])
 
         for widget in (
             self.center_txt,
@@ -866,7 +872,30 @@ class CubeViewer(ipw.VBox):
         ):
             field.observe(self._sync_plane, names="value")
         self.viewer3d.viewer.layout = ipw.Layout(width="100%", height="450px")
+        # NGL initially sizes its canvas from its parent's width. Give it a
+        # dedicated flex column rather than the full viewer/controls row.
+        canvas_column = ipw.VBox(
+            [self.viewer3d.viewer],
+            layout=ipw.Layout(min_width="320px", flex="1 1 480px"),
+        )
         self.viewer3d.show_plane_checkbox.value = False
+        plane_controls = ipw.VBox(
+            [
+                self.viewer3d.show_plane_checkbox,
+                self.slice2d.plane_controls,
+                self.viewer3d.plane_resolution,
+            ],
+            layout=ipw.Layout(width="440px"),
+        )
+        self.viewer3d.children = (
+            ipw.HBox(
+                [canvas_column, plane_controls],
+                layout=ipw.Layout(flex_flow="row wrap", align_items="flex-start"),
+            ),
+            self.viewer3d.isovalues,
+            self.viewer3d.show_isosurfaes_button,
+        )
+        self.slice2d.children = (self.slice2d.plot_controls,)
         self.width = ipw.BoundedIntText(
             value=1600, min=320, max=4096, description="Width (px)"
         )
@@ -935,6 +964,8 @@ class CubeViewer(ipw.VBox):
             self.viewer3d.viewer._remote_call("handleResize", target="Widget")
 
     def _sync_plane(self, _=None):
+        if self.slice2d._updating_color_range:
+            return
         if not self.slice2d._inputs_valid():
             self.viewer3d.hide_and_remove_plane()
             return
@@ -961,6 +992,63 @@ class CubeViewer(ipw.VBox):
             background=self.background.value,
             opacity=self.opacity.value,
         )
+
+    def view_settings(self):
+        """Snapshot the view as plain data, including the linked slice plane."""
+        return {
+            "version": 1,
+            "render": self.render_settings(),
+            "plane": self.slice2d.return_settings(),
+            "show_plane": self.viewer3d.show_plane_checkbox.value,
+            "plane_resolution": self.viewer3d.plane_resolution.value,
+        }
+
+    def apply_view_settings(self, state):
+        """Restore a saved view after its source cube has been loaded."""
+        if state.get("version") != 1:
+            raise ValueError("Unsupported visualization version")
+        plane, render = state["plane"], state["render"]
+        if plane["periodic"] != self.slice2d.periodic:
+            raise ValueError("The saved view uses different boundary conditions")
+        rows = self.viewer3d.isovalues
+        if any(not rows.iso_min <= value <= rows.iso_max for value, _ in render["iso"]):
+            raise ValueError("The saved isovalues are outside this cube's range")
+        rows.isovalues.children = ()
+        for value, color in render["iso"]:
+            rows.add_isovalue()
+            row = rows.isovalues.children[-1]
+            row.value, row.color_widget.value = value, color
+        self.viewer3d.apply_isosurfaces()
+        for key in ("width", "height", "background", "opacity"):
+            getattr(self, key).value = render[key]
+        cut = self.slice2d
+        # Suppress intermediate slices while restoring the complete plane.
+        cut._updating_color_range = True
+        try:
+            for key in ("center", "normal"):
+                getattr(cut, key + "_txt").value = " ".join(map(str, plane[key]))
+            cut.offset_txt.value = str(plane["offset"])
+            for attr, key in (
+                ("width", "width"),
+                ("height", "height"),
+                ("res", "resolution"),
+                ("show_2d_checkbox", "show_2d"),
+                ("show_contours", "show_contours"),
+                ("auto_color_range", "auto_color_range"),
+                ("vmin", "vmin"),
+                ("vmax", "vmax"),
+            ):
+                getattr(cut, attr).value = plane[key]
+        finally:
+            cut._updating_color_range = False
+        cut._on_any_change()
+        self.viewer3d.plane_resolution.value = state["plane_resolution"]
+        self.viewer3d.show_plane_checkbox.value = state["show_plane"]
+        self._sync_plane()
+        orientation = list(render["orientation"])
+        self.viewer3d.viewer._camera_orientation = orientation
+        self.viewer3d.viewer._set_camera_orientation(orientation)
+        self.tabs.selected_index = 0
 
     def _render(self, _=None):
         import html

@@ -112,3 +112,16 @@ CalcJob submission and source-file availability checks. The widget never
 launches a local renderer. The 2D plot can be exported directly as a PNG.
 The original Surfaces calculation browser has not yet been switched to this
 shared component; that migration belongs in its maintained app component PR.
+
+Plane position/orientation controls sit beside the 3D canvas; the 2D tab holds
+the slice image and export controls. `viewer.view_settings()` returns a versioned
+plain-data snapshot of camera, surfaces, render options and slice settings.
+After loading the corresponding cube, `viewer.apply_view_settings(snapshot)`
+restores that view.
+
+`aiidalab_widgets_empa.cube_views.SavedCubeViews` supplies named-view controls:
+save, restore, update, remove and render multiple selected views. Applications
+provide `save`, `list_views`, `load`, `remove` and `render` callbacks, keeping
+persistence and job submission outside the data-only widget. ORCA stores these
+configurations as separate user annotations on the cube manifest and captures
+each submitted render's settings as immutable CalcJob inputs.

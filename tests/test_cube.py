@@ -177,3 +177,76 @@ def test_cube_switch_keeps_user_isovalues_within_new_range(tmp_path):
     viewer.set_cube(other)
     assert all(row.value == 0.5 for row in viewer.viewer3d.isovalues.isovalues.children)
     viewer.close()
+
+
+def test_saved_view_restores_camera_surfaces_and_slice_in_3d_tab():
+    viewer = CubeViewer()
+    viewer.set_cube(sample_cube())
+    viewer.viewer3d.viewer._camera_orientation = (np.eye(4) * 20).ravel().tolist()
+    viewer.slice2d.offset_txt.value = ".3"
+    viewer.slice2d.normal_txt.value = "1 0 0"
+    viewer.viewer3d.show_plane_checkbox.value = True
+    viewer.background.value = "#123456"
+    snapshot = viewer.view_settings()
+    viewer.viewer3d.viewer._camera_orientation = np.eye(4).ravel().tolist()
+    viewer.slice2d.offset_txt.value = "0"
+    viewer.slice2d.normal_txt.value = "0 0 1"
+    viewer.viewer3d.show_plane_checkbox.value = False
+    viewer.background.value = "#FFFFFF"
+    viewer.viewer3d.isovalues.isovalues.children[0].value = 0.01
+    viewer.apply_view_settings(snapshot)
+    assert viewer.view_settings() == snapshot
+    assert viewer.tabs.selected_index == 0
+    assert (
+        viewer.slice2d.plane_controls
+        in viewer.viewer3d.children[0].children[1].children
+    )
+    assert viewer.slice2d.children == (viewer.slice2d.plot_controls,)
+    assert viewer.viewer3d._plane_component is not None
+    viewer.close()
+
+
+def test_named_view_collection_keeps_multiple_views_and_reopens():
+    from aiidalab_widgets_empa.cube_views import SavedCubeViews
+
+    records, loaded, submitted = {}, [], []
+
+    def save(name, identifier):
+        identifier = identifier or str(len(records) + 1)
+        records[identifier] = dict(id=identifier, name=name, label=name)
+        return identifier
+
+    def make_widget():
+        return SavedCubeViews(
+            save=save,
+            list_views=lambda: list(records.values()),
+            load=loaded.append,
+            remove=records.pop,
+            render=submitted.append,
+        )
+
+    widget = make_widget()
+    widget.save_button.click()
+    assert "name" in widget.message.value and not records
+    for name in ("Top", "Side"):
+        widget.name.value = name
+        widget.save_button.click()
+    assert len(records) == 2 and not submitted
+    widget.close()
+    widget = make_widget()
+    assert len(widget.saved.options) == 2
+    widget.saved.value = ("1",)
+    widget.load_button.click()
+    assert loaded == ["1"]
+    widget.name.value = "New top"
+    widget.update_button.click()
+    assert records["1"]["name"] == "New top" and len(records) == 2
+    widget.saved.value = ("1", "2")
+    assert widget.load_button.disabled
+    widget.render_button.click()
+    assert submitted == [["1", "2"]]
+    widget.remove_button.click()
+    assert not records
+    widget.refresh_button.click()
+    assert not widget.saved.options and widget.render_button.disabled
+    widget.close()
