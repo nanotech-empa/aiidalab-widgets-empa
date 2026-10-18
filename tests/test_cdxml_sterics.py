@@ -83,7 +83,9 @@ def test_finite_planar_import_keeps_graph_hydrogens_and_both_methyls():
     assert widget.structure.get_chemical_formula() == "C14H14"
     assert widget.structure.pbc.tolist() == [False, False, False]
     assert "All hydrogens retained" in widget.output_message.value
-    assert not widget.structure.info  # no stale index-based graph after editing
+    assert "_cdxml_bonds" not in widget.structure.info
+    assert "_cdxml_stereochemistry" not in widget.structure.info
+    assert widget.structure.info["cdxml_source"]["formal_charge"] == 0
     assert np.allclose(
         bond_lengths(widget.structure, bonds), bond_lengths(prepared, bonds)
     )
@@ -169,7 +171,8 @@ def test_periodic_import_disables_torsions_and_keeps_existing_formula():
     widget.create_button.click()
     assert widget.structure.get_chemical_formula() == "C14H4"
     assert np.ptp(widget.structure.positions[:, 2]) < 1e-9
-    assert not widget.structure.info
+    assert "_cdxml_bonds" not in widget.structure.info
+    assert "_cdxml_stereochemistry" not in widget.structure.info
 
 
 def test_rigid_or_unsupported_inputs_report_contacts_without_deleting_atoms():
