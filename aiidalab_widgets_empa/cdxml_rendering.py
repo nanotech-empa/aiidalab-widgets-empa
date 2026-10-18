@@ -15,7 +15,9 @@ import numpy as np
 from ase.data import chemical_symbols
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
-from matplotlib.patches import Circle
+from matplotlib.patches import Circle, FancyArrowPatch
+
+from .cdxml_graph import radical_electrons
 
 
 def _elements(root, name):
@@ -84,7 +86,14 @@ def _bond_segments(first, second, order, position, spacing):
     return [(first + left * offset, second + left * offset) for offset in offsets]
 
 
-def render_cdxml_png(content: bytes | str, *, highlighted_bonds=(), max_pixels=1200):
+def render_cdxml_png(
+    content: bytes | str,
+    *,
+    highlighted_bonds=(),
+    max_pixels=1200,
+    atom_indices=None,
+    return_layout=False,
+):
     """Draw a selected CDXML fragment as a proportionate PNG on white.
 
     Explicit DoublePosition overrides win; ring doubles without an override
@@ -185,10 +194,26 @@ def render_cdxml_png(content: bytes | str, *, highlighted_bonds=(), max_pixels=1
         if bond.get("id") in highlighted:
             line(first, second, color="#d88413", style="--", linewidth=stroke * 1.3)
             continue
-        try:
-            order = 1.5 if bond.get("Order") == "A" else float(bond.get("Order", "1"))
-        except ValueError:
-            order = 1.0
+        if bond.get("Order", "").strip().lower() == "dative":
+            axis.add_patch(
+                FancyArrowPatch(
+                    first,
+                    second,
+                    arrowstyle="-|>",
+                    mutation_scale=max(5, font_size * 0.65),
+                    shrinkA=font_size * 0.45,
+                    shrinkB=font_size * 0.65,
+                    linewidth=stroke,
+                    color="#151515",
+                    zorder=1,
+                )
+            )
+            continue
+        kind = bond.get("Order", "1").strip().lower()
+        orders = {"1": 1.0, "2": 2.0, "3": 3.0, "1.5": 1.5, "a": 1.5, "aromatic": 1.5}
+        if kind not in orders:
+            raise ValueError(f"Cannot preview unsupported bond order {kind!r}.")
+        order = orders[kind]
         position = bond.get(
             "DoublePosition", auto_positions.get(bond.get("id"), "Center")
         )
@@ -252,8 +277,12 @@ def render_cdxml_png(content: bytes | str, *, highlighted_bonds=(), max_pixels=1
         atomic_number = int(node.get("Element", "6"))
         label = "".join(item.text or "" for item in _elements(node, "s"))
         charge = int(node.get("Charge", "0"))
-        if not label and (atomic_number != 6 or charge):
-            label = chemical_symbols[atomic_number]
+        isotope = int(node.get("Isotope", "0"))
+        if not label and (atomic_number != 6 or charge or isotope):
+            label = (str(isotope) if isotope else "") + chemical_symbols[atomic_number]
+            hydrogens = int(node.get("NumHydrogens", "0"))
+            if hydrogens:
+                label += "H" + (str(hydrogens) if hydrogens > 1 else "")
             if charge:
                 label += (str(abs(charge)) if abs(charge) > 1 else "") + (
                     "+" if charge > 0 else "−"
@@ -269,16 +298,18 @@ def render_cdxml_png(content: bytes | str, *, highlighted_bonds=(), max_pixels=1
                 zorder=3,
                 bbox={"facecolor": "white", "edgecolor": "none", "pad": 0.2},
             )
-        if node.get("Radical", "").lower() in ("doublet", "1"):
+        electron_count = radical_electrons(root, node)
+        if electron_count:
             radius = 0.035 * bond_length
-            axis.add_patch(
-                Circle(
-                    position + np.array([0.16, -0.16]) * bond_length,
-                    radius,
-                    color="#151515",
-                    zorder=4,
+            for dot in range(electron_count):
+                axis.add_patch(
+                    Circle(
+                        position + np.array([0.16 + dot * 0.10, -0.16]) * bond_length,
+                        radius,
+                        color="#151515",
+                        zorder=4,
+                    )
                 )
-            )
     for graphic in graphics.values():
         if graphic.get("SymbolType", "").lower() != "electron":
             continue
@@ -286,11 +317,22 @@ def render_cdxml_png(content: bytes | str, *, highlighted_bonds=(), max_pixels=1
             identifier = representation.get("object")
             if identifier in positions and nodes[identifier].get(
                 "Radical", ""
-            ).lower() not in ("doublet", "1"):
+            ).lower() not in {"doublet", "2", "singlet", "1", "triplet", "3"}:
                 point = positions[identifier] + np.array([0.16, -0.16]) * bond_length
                 axis.plot(
                     *point, marker="o", markersize=stroke * 2, color="#151515", zorder=4
                 )
+    for identifier, index in (atom_indices or {}).items():
+        if identifier in positions:
+            point = positions[identifier] + np.array([0.12, 0.18]) * bond_length
+            axis.text(
+                *point,
+                str(index),
+                fontsize=font_size * 0.55,
+                color="#135d9e",
+                zorder=5,
+                bbox={"facecolor": "white", "edgecolor": "none", "pad": 0.1},
+            )
 
     centres = [(first + second) / 2 for first, second in brackets]
     for index, (first, second) in enumerate(brackets):
@@ -314,7 +356,16 @@ def render_cdxml_png(content: bytes | str, *, highlighted_bonds=(), max_pixels=1
     buffer = BytesIO()
     figure.savefig(buffer, format="png", dpi=dpi, facecolor="white")
     figure.clear()
-    return buffer.getvalue()
+    png = buffer.getvalue()
+    if return_layout:
+        return png, {
+            "low": low.tolist(),
+            "high": high.tolist(),
+            "positions": {
+                identifier: point.tolist() for identifier, point in positions.items()
+            },
+        }
+    return png
 
 
 def set_png_widget(image_widget, content: bytes, *, max_side=300):

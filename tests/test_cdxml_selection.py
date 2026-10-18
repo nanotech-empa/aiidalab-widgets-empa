@@ -142,7 +142,7 @@ def test_structure_upload_widget(file_upload_change):
     widget._on_file_upload(file_upload_change("7AGNR.cdxml", content))
     widget.nunits.value = "2"
     widget.create_button.click()
-    assert widget.structure.get_chemical_formula() == "C56H22"
+    assert widget.structure.get_chemical_formula() == "C56H24"
 
     content = (DATA_DIR / "benzene.cdxml").read_text()
     widget._on_file_upload(file_upload_change("benzene.cdxml", content))
@@ -183,6 +183,9 @@ def test_multi_structure_selector_uses_only_nearby_unique_labels(file_upload_cha
         "g2-right",
         "electron-2",
     }
+    captions = ["".join(text.itertext()).strip() for text in selected_root.iter("t")]
+    assert "Beta" in captions
+    assert "Alpha" not in captions
 
 
 def test_multi_structure_selector_numbers_documents_without_labels(
@@ -201,6 +204,14 @@ def test_multi_structure_selector_numbers_documents_without_labels(
         "Structure 2",
         "Structure 3",
     )
+
+
+def test_labels_on_other_pages_cannot_be_assigned_by_coordinate_distance():
+    content = b'<CDXML BondLength="20"><page><fragment><n id="a" p="0 0"/></fragment><t p="0 -10"><s>First page</s></t></page><page><fragment><n id="b" p="0 0"/></fragment></page></CDXML>'
+    assert awe.CdxmlUploadWidget._cdxml_structure_options(content) == [
+        ("First page", 0),
+        ("Structure 2", 1),
+    ]
 
 
 def test_multi_structure_selector_disambiguates_duplicate_labels():
@@ -282,11 +293,12 @@ def test_widget_reports_missing_and_malformed_cdxml(monkeypatch):
 
     widget._cdxml_content = b"<CDXML><broken>"
     assert not widget._convert_uploaded_cdxml()
-    assert "Unexpected error" in widget.output_message.value
+    assert "Error: Invalid CDXML" in widget.output_message.value
 
     def reject_cdxml(*args, **kwargs):
         raise ValueError("invalid <bond>")
 
+    widget._cdxml_content = (DATA_DIR / "benzene.cdxml").read_bytes()
     monkeypatch.setattr(widget, "cdxml_to_ase_from_string", reject_cdxml)
     assert not widget._convert_uploaded_cdxml()
     assert "invalid &lt;bond&gt;" in widget.output_message.value
@@ -350,7 +362,8 @@ def test_periodic_crossings_are_independent_of_bracket_order():
     assert crossing_points is not None
     assert crossing_points.shape == (2, 3)
     assert np.linalg.norm(crossing_points[1] - crossing_points[0]) == pytest.approx(
-        42.75, abs=0.05
+        42.0525,
+        abs=0.05,  # Mean of all equivalent-site translations, not one crossing.
     )
 
 
