@@ -14,15 +14,13 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Natural Language :: English",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
-requires-python = ">=3.9,<4"
+requires-python = ">=3.12,<4"
 readme = "README.md"
 dependencies = [
-    "aiida-core>=2.6.0,<3",
+    "aiida-core>=2.8,<3",
     "ase>=3.24",
     "matplotlib",  # shared CDXML drawing renderer; already required by ASE
     "ipywidgets>=7.6.0",
