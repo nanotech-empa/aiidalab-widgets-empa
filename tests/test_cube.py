@@ -25,6 +25,42 @@ def sample_cube():
     )
 
 
+def test_close_is_idempotent_and_releases_application_callback(monkeypatch):
+    viewer = CubeViewer(on_render=lambda settings: None)
+    unlinked, closed = [], []
+    unlink = viewer._cube_link.unlink
+    close = viewer.viewer3d.viewer.close
+
+    def record_unlink():
+        unlinked.append(True)
+        unlink()
+
+    def record_close():
+        closed.append(True)
+        close()
+
+    monkeypatch.setattr(viewer._cube_link, "unlink", record_unlink)
+    monkeypatch.setattr(viewer.viewer3d.viewer, "close", record_close)
+    viewer.close()
+    viewer.close()
+    assert unlinked == closed == [True]
+    assert viewer._render_callback is None
+    assert viewer.viewer3d._external_plane_sync_cb is None
+
+
+def test_late_plane_changes_do_not_call_a_closed_viewer(monkeypatch):
+    synchronized = []
+    monkeypatch.setattr(
+        CubeViewer, "_sync_plane", lambda self, *args: synchronized.append(True)
+    )
+    viewer = CubeViewer()
+    viewer.close()
+    synchronized.clear()
+    viewer.slice2d.offset_txt.value = "0.5"
+    viewer.viewer3d.plane_resolution.value = 64
+    assert synchronized == []
+
+
 def test_origin_and_skewed_grid_interpolation():
     cube = sample_cube()
     widget = CubePlaneCut2D()

@@ -907,7 +907,7 @@ class CubeViewer(ipw.VBox):
         self.viewer3d.slice2d = self.slice2d
         self._cube_link = tl.dlink((self.viewer3d, "cube"), (self.slice2d, "cube"))
         self.viewer3d._external_plane_sync_cb = self._sync_plane
-        for field in (
+        self._plane_fields = (
             self.slice2d.center_txt,
             self.slice2d.normal_txt,
             self.slice2d.offset_txt,
@@ -919,7 +919,8 @@ class CubeViewer(ipw.VBox):
             self.slice2d.vmin,
             self.slice2d.vmax,
             self.viewer3d.plane_resolution,
-        ):
+        )
+        for field in self._plane_fields:
             field.observe(self._sync_plane, names="value")
         self.viewer3d.viewer.layout = ipw.Layout(width="100%", height="450px")
         # NGL initially sizes its canvas from its parent's width. Give it a
@@ -1219,7 +1220,17 @@ class CubeViewer(ipw.VBox):
             self.slice_download.value = f'<a download="cube-slice.png" href="data:image/png;base64,{encoded}">Download 2D slice PNG</a>'
 
     def close(self):
-        if hasattr(self, "_cube_link"):
-            self._cube_link.unlink()
+        if getattr(self, "_cube_closed", False):
+            return
+        self._cube_closed = True
+        self._render_callback = None
+        for field in getattr(self, "_plane_fields", ()):
+            field.unobserve(self._sync_plane, names="value")
+        if hasattr(self, "viewer3d"):
+            self.viewer3d._external_plane_sync_cb = None
+        link = getattr(self, "_cube_link", None)
+        if link is not None:
+            link.unlink()
+            self._cube_link = None
             self.viewer3d.viewer.close()
         super().close()
