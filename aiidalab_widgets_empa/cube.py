@@ -782,7 +782,7 @@ class CubeArrayData3dViewerWidget(ipw.VBox):
         self._structure_component.add_ball_and_stick(
             roughness=1 - self.lighting["gloss"]
         )
-        with tempfile.NamedTemporaryFile(mode="w") as tempf:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".cube") as tempf:
             ase.io.cube.write_cube(
                 tempf,
                 self.structure,

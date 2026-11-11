@@ -110,6 +110,28 @@ def test_viewer_preserves_volume_origin_and_signed_values(monkeypatch):
     viewer.close()
 
 
+def test_cube_transfer_does_not_guess_compression_from_random_filename(monkeypatch):
+    from aiidalab_widgets_empa import cube as component
+
+    original = tempfile.NamedTemporaryFile
+
+    def gzip_like_filename(*args, **kwargs):
+        # A suffixless real temporary filename can randomly end in "gz".
+        kwargs.setdefault("suffix", "gz")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(component.tempfile, "NamedTemporaryFile", gzip_like_filename)
+    viewer = CubeViewer()
+    try:
+        source = sample_cube()
+        viewer.set_cube(source)
+        assert viewer.viewer3d._cube_component is not None
+        assert viewer.viewer3d.cube is source
+        assert viewer.slice2d.slice_png.startswith(b"\x89PNG")
+    finally:
+        viewer.close()
+
+
 def test_slice_controls_and_invalid_edit_clear_the_old_image():
     viewer = CubeViewer()
     viewer.set_cube(sample_cube())
