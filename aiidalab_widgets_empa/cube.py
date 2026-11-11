@@ -673,6 +673,7 @@ class CubeArrayData3dViewerWidget(ipw.VBox):
     """Widget to view cube data in 3D and overlay a slicing plane."""
 
     cube = tl.Instance(Cube, allow_none=True)
+    surface_opacity = tl.Float(1.0)
 
     def __init__(self, **kwargs):
         self.structure = None
@@ -816,11 +817,17 @@ class CubeArrayData3dViewerWidget(ipw.VBox):
                     color=col,
                     isolevelType="value",
                     isolevel=isov,
+                    opacity=self.surface_opacity,
                     roughness=1 - self.lighting["gloss"],
                     metalness=0,
                 )
             except Exception:
                 logger.debug("add_surface failed", exc_info=True)
+
+    @tl.observe("surface_opacity")
+    def _on_surface_opacity(self, _=None):
+        if hasattr(self, "_cube_component"):
+            self.apply_isosurfaces()
 
     def _apply_stage_lighting(self):
         self.viewer.parameters = dict(
@@ -1015,6 +1022,9 @@ class CubeViewer(ipw.VBox):
             step=0.05,
             description="Opacity",
             continuous_update=False,
+        )
+        self._opacity_link = tl.dlink(
+            (self.opacity, "value"), (self.viewer3d, "surface_opacity")
         )
         self.render_button = ipw.Button(
             description="Render image",
@@ -1228,6 +1238,10 @@ class CubeViewer(ipw.VBox):
             field.unobserve(self._sync_plane, names="value")
         if hasattr(self, "viewer3d"):
             self.viewer3d._external_plane_sync_cb = None
+        opacity_link = getattr(self, "_opacity_link", None)
+        if opacity_link is not None:
+            opacity_link.unlink()
+            self._opacity_link = None
         link = getattr(self, "_cube_link", None)
         if link is not None:
             link.unlink()
