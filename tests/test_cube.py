@@ -348,3 +348,38 @@ def test_named_view_collection_keeps_multiple_views_and_reopens():
     widget.refresh_button.click()
     assert not widget.saved.options and widget.render_button.disabled
     widget.close()
+
+
+def test_preview_opacity_matches_render_settings_and_saved_view(monkeypatch):
+    viewer = CubeViewer()
+    viewer.set_cube(sample_cube())
+    viewer.viewer3d.viewer._camera_orientation = np.eye(4).ravel().tolist()
+    observed = []
+    monkeypatch.setattr(
+        viewer.viewer3d,
+        "apply_isosurfaces",
+        lambda: observed.append(viewer.viewer3d.surface_opacity),
+    )
+    assert viewer.viewer3d.surface_opacity == viewer.opacity.value
+    viewer.opacity.value = 0.35
+    assert observed[-1] == 0.35
+    assert viewer.render_settings()["opacity"] == 0.35
+    state = viewer.view_settings()
+    viewer.opacity.value = 0.9
+    viewer.apply_view_settings(state)
+    assert (
+        viewer.viewer3d.surface_opacity == viewer.render_settings()["opacity"] == 0.35
+    )
+    link = viewer._opacity_link
+    unlinked = []
+    original = link.unlink
+
+    def record_unlink():
+        unlinked.append(True)
+        original()
+
+    monkeypatch.setattr(link, "unlink", record_unlink)
+    viewer.close()
+    viewer.close()
+    assert unlinked == [True]
+    assert viewer._opacity_link is None
