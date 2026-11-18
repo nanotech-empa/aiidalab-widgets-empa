@@ -20,7 +20,7 @@ classifiers = [
 requires-python = ">=3.12,<4"
 readme = "README.md"
 dependencies = [
-    "aiida-core>=2.8,<3",
+    "aiida-core>=2.9.4,<3",
     "ase>=3.24",
     "rdkit",  # chemical interpretation and validation of CDXML graphs
     "matplotlib",  # shared CDXML drawing renderer; already required by ASE
